@@ -3,7 +3,7 @@ Application configuration via environment variables.
 """
 
 from pydantic_settings import BaseSettings
-from pydantic import Field
+from pydantic import Field, field_validator
 from typing import List
 import json
 import urllib.parse
@@ -16,6 +16,14 @@ class Settings(BaseSettings):
     APP_NAME: str = "Supplier 360"
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = False
+
+    @field_validator("DEBUG", mode="before")
+    @classmethod
+    def normalize_debug(cls, value):
+        """Accept common deployment labels without preventing startup."""
+        if isinstance(value, str) and value.strip().lower() in {"release", "production", "prod"}:
+            return False
+        return value
 
     # --- Database ---
     DATABASE_URL: str = "postgresql+asyncpg://supplier360:supplier360_dev@localhost:5432/supplier360"
@@ -44,6 +52,11 @@ class Settings(BaseSettings):
     # --- File Storage ---
     UPLOAD_DIR: str = "data/contracts"
     MAX_UPLOAD_SIZE_MB: int = 20
+
+    # --- Market Price Research ---
+    TAVILY_API_KEY: str = ""
+    BRAVE_SEARCH_API_KEY: str = ""
+    FIRECRAWL_API_KEY: str = ""
 
     # --- CORS ---
     CORS_ORIGINS: str = '["http://localhost:5173","http://localhost:3000"]'

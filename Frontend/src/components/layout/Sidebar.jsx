@@ -10,13 +10,16 @@ import {
   GitCompare,
   Upload,
   Layers,
+  MessageSquare,
 } from 'lucide-react';
 
 const navItems = [
   { to: '/', icon: LayoutDashboard, label: 'Dashboard' },
   { to: '/suppliers', icon: Users, label: 'Suppliers' },
-  { to: '/comparison', icon: GitCompare, label: 'Supplier Comparison' },
+  // { to: '/comparison', icon: GitCompare, label: 'Supplier Comparison' },
+  { to: '/contracts', icon: FileText, label: 'Contracts' },
   { to: '/documents', icon: Upload, label: 'Documents' },
+  { to: '/assistant', icon: MessageSquare, label: 'AI Assistant' },
 ];
 
 export default function Sidebar() {

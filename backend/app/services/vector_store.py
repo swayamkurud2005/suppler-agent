@@ -163,9 +163,44 @@ class VectorStoreService:
                     )
                 except Exception:
                     pass
+            self.sync_from_qdrant()
         except Exception as e:
             logger.warning(f"Failed to verify Qdrant collection ({e}). Falling back to memory.")
             self.client = None
+
+    def sync_from_qdrant(self):
+        """Syncs existing collection points from Qdrant into _memory_chunks so BM25 has complete corpus."""
+        if not self.client:
+            return
+        try:
+            records, _ = self.client.scroll(
+                collection_name=self.collection_name,
+                limit=1000,
+                with_payload=True,
+                with_vectors=False,
+            )
+            synced = []
+            seen_ids = set()
+            for r in records:
+                p = r.payload or {}
+                cid = p.get("chunk_id") or str(r.id)
+                if cid not in seen_ids:
+                    seen_ids.add(cid)
+                    synced.append({
+                        "chunk_id": cid,
+                        "contract_id": p.get("contract_id"),
+                        "supplier_id": p.get("supplier_id"),
+                        "page_number": p.get("page_number", 1),
+                        "section_title": p.get("section_title", ""),
+                        "clause_type": p.get("clause_type", "general"),
+                        "document_name": p.get("document_name", "Contract Document"),
+                        "text": p.get("text", ""),
+                    })
+            if synced:
+                self._memory_chunks = synced
+                logger.info(f"Synchronized {len(synced)} chunks from Qdrant into memory corpus for BM25.")
+        except Exception as e:
+            logger.warning(f"Could not sync chunks from Qdrant: {e}")
 
     def upsert_chunks(self, chunks: List[Dict[str, Any]]) -> int:
         """
@@ -307,6 +342,28 @@ class VectorStoreService:
 
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:limit]
+
+    def delete_by_supplier(self, supplier_id: str) -> None:
+        """Remove all retrieval records for a supplier before a hard delete."""
+        self._memory_chunks = [c for c in self._memory_chunks if c.get("supplier_id") != supplier_id]
+        if self.client:
+            try:
+                self.client.delete(
+                    collection_name=self.collection_name,
+                    points_selector=qmodels.FilterSelector(filter=qmodels.Filter(must=[
+                        qmodels.FieldCondition(key="supplier_id", match=qmodels.MatchValue(value=supplier_id))
+                    ])),
+                )
+            except Exception as exc:
+                logger.warning("Could not remove Qdrant vectors for supplier %s: %s", supplier_id, exc)
+
+    def delete_by_contract(self, contract_id: str) -> None:
+        self._memory_chunks = [c for c in self._memory_chunks if c.get("contract_id") != contract_id]
+        if self.client:
+            try:
+                self.client.delete(collection_name=self.collection_name, points_selector=qmodels.FilterSelector(filter=qmodels.Filter(must=[qmodels.FieldCondition(key="contract_id", match=qmodels.MatchValue(value=contract_id))])))
+            except Exception as exc:
+                logger.warning("Could not remove Qdrant vectors for contract %s: %s", contract_id, exc)
 
     def seed_default_contract_chunks(self):
         """Pre-seeds standard contract clauses for instant RAG responses."""

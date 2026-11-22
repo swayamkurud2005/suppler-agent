@@ -53,6 +53,38 @@ class RetrievalTrace(BaseModel):
 
 
 # ──────────────────────────────────────────────────────────────
+# Contract Supplier Extraction
+# ──────────────────────────────────────────────────────────────
+class ExtractedField(BaseModel):
+    value: Optional[str] = None
+    confidence: float = 0.0
+    source: Optional[str] = None
+
+
+class SupplierCandidate(BaseModel):
+    name: str
+    role: str
+    description: Optional[str] = None
+
+
+class SupplierExtractionData(BaseModel):
+    supplier_name: ExtractedField
+    category: ExtractedField
+    location: ExtractedField
+    contact_person: ExtractedField
+    contact_email: ExtractedField
+    contact_phone: ExtractedField
+    multiple_candidates: list[SupplierCandidate] = []
+    is_duplicate: bool = False
+    existing_supplier: Optional[dict[str, Any]] = None
+    document_token: Optional[str] = None
+    filename: Optional[str] = None
+    file_size: Optional[int] = None
+    pages_parsed: Optional[int] = None
+    chunks_extracted: Optional[int] = None
+
+
+# ──────────────────────────────────────────────────────────────
 # Supplier (matches frontend Supplier type)
 # ──────────────────────────────────────────────────────────────
 class SupplierResponse(BaseModel):
@@ -298,4 +330,94 @@ class ExtractedContractInfo(BaseModel):
     arbitration_location: str | None = None
     products: list[ExtractedProduct] = []
     confidence: float = 0.0
+
+
+# ──────────────────────────────────────────────────────────────
+# Market Price Benchmarking Schemas
+# ──────────────────────────────────────────────────────────────
+class ContractPricingDetails(BaseModel):
+    material_name: str
+    grade: Optional[str] = None
+    product_code: Optional[str] = None
+    technical_characteristics: Optional[str] = None
+    contract_unit_price: float
+    currency: str = "INR"
+    unit_of_measurement: str = "kg"
+    contract_quantity: Optional[float] = None
+    annual_estimated_quantity: Optional[float] = None
+    contract_effective_date: Optional[str] = None
+    contract_expiry_date: Optional[str] = None
+    delivery_location: Optional[str] = None
+    incoterms: Optional[str] = None
+    tax_inclusion: Optional[str] = None
+    packaging_details: Optional[str] = None
+    supplier_name: Optional[str] = None
+    contract_id: Optional[str] = None
+    contract_title: Optional[str] = None
+    evidence_sources: list[str] = []
+
+
+class MarketPriceObservationSchema(BaseModel):
+    id: str
+    source_name: str
+    source_url: str
+    material_name: str
+    grade: Optional[str] = None
+    specification: Optional[str] = None
+    raw_price: Optional[float] = None
+    raw_currency: Optional[str] = None
+    raw_unit: Optional[str] = None
+    normalized_price: float
+    normalized_currency: str = "INR"
+    normalized_unit: str = "kg"
+    exchange_rate_applied: Optional[float] = None
+    unit_conversion_ratio: Optional[float] = None
+    location: Optional[str] = None
+    observation_date: Optional[str] = None
+    price_type: Optional[str] = None
+    delivery_conditions: Optional[str] = None
+    tax_inclusion: Optional[str] = None
+    match_classification: str = "high"  # high | partial | low | not_comparable
+    match_rationale: Optional[str] = None
+    snippet: Optional[str] = None
+    is_included_in_benchmark: bool = True
+    retrieved_at: Optional[str] = None
+
+
+class PricingInsightSchema(BaseModel):
+    verdict: str  # "Above Market", "Below Market", "In Line with Market"
+    summary: str
+    financial_impact: str
+    reliability_evaluation: str
+    spec_and_terms_caveats: list[str] = []
+    recommended_actions: list[str] = []
+    negotiation_points: list[str] = []
+
+
+class PriceBenchmarkResponse(BaseModel):
+    research_run_id: str
+    supplier_id: str
+    supplier_name: str
+    contract_details: ContractPricingDetails
+    market_benchmark_median: Optional[float] = None
+    market_min_price: Optional[float] = None
+    market_max_price: Optional[float] = None
+    market_avg_price: Optional[float] = None
+    variance_pct: Optional[float] = None
+    potential_annual_difference: Optional[float] = None
+    confidence_score: Optional[float] = None
+    confidence_level: str = "Moderate"
+    observations: list[MarketPriceObservationSchema] = []
+    historical_trend: list[dict[str, Any]] = []
+    ai_insight: Optional[PricingInsightSchema] = None
+    created_at: Optional[str] = None
+    status: str = "completed"
+    research_notice: Optional[str] = None
+
+
+class PricingResearchRequest(BaseModel):
+    region: Optional[str] = "India"
+    comparison_period: Optional[str] = "Current Quarter"
+    force_refresh: Optional[bool] = False
+
 

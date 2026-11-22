@@ -5,6 +5,7 @@ with Qdrant hybrid contract clauses into actionable procurement intelligence.
 
 import json
 import logging
+import re
 from typing import Dict, Any, List
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,6 +16,147 @@ from app.services.sql_retriever import sql_retriever
 from app.services.hybrid_retriever import hybrid_retriever
 
 logger = logging.getLogger("agent_nodes")
+
+_QUERY_STOP_WORDS = {
+    "a", "an", "and", "are", "at", "by", "can", "do", "does", "for", "from",
+    "how", "i", "in", "is", "it", "me", "of", "on", "or", "please", "tell",
+    "the", "this", "to", "us", "what", "when", "where", "which", "who", "why",
+    "with", "would", "you", "about", "contract", "agreement", "supplier",
+}
+
+
+def _is_party_identity_question(query: str) -> bool:
+    query_lower = (query or "").lower()
+    return any(phrase in query_lower for phrase in (
+        "who is the supplier", "who is supplier", "who is the buyer", "who is buyer",
+        "supplier and buyer", "buyer and supplier", "contracting parties", "who are the parties",
+    ))
+
+
+def _extract_party_identity(evidence: List[Dict[str, Any]]) -> str | None:
+    """Extract named parties only from explicit Buyer/Supplier signature labels."""
+    combined_text = "\n".join(item.get("text", "") for item in evidence)
+
+    def labelled_party(label: str) -> str | None:
+        match = re.search(
+            rf"For\s+{label}\s*:\s*(.+?)(?=\s+(?:Name|Title|Signature|Date)\s*:|\s+For\s+(?:Buyer|Supplier)\s*:|$)",
+            combined_text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            return None
+        name = " ".join(match.group(1).split()).strip(" .")
+        # A label without a legal entity name is not an answer.
+        return name if len(name) >= 3 else None
+
+    buyer = labelled_party("Buyer")
+    supplier = labelled_party("Supplier")
+    if buyer and supplier:
+        return f"Buyer: {buyer}.\nSupplier: {supplier}."
+    return None
+
+
+def _select_supported_evidence(query: str, evidence: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep only clauses that contain a meaningful word from the user's question.
+
+    Vector similarity always returns a nearest chunk, even for an unrelated question.
+    This lexical gate makes contract chat fail closed instead of treating that nearest
+    chunk as proof.
+    """
+    is_party_identity_question = _is_party_identity_question(query)
+
+    # Supplier and Buyer occur throughout normal obligations. They identify the
+    # parties only in the agreement preamble/definitions, so never use an
+    # operational clause (delay, quality, indemnity, etc.) to answer this question.
+    if is_party_identity_question:
+        identity_markers = (
+            "by and between", "entered into between", "agreement between",
+            "parties to this agreement", "buyer:", "supplier:",
+        )
+        return [
+            item for item in evidence
+            if any(marker in item.get("text", "").lower() for marker in identity_markers)
+        ][:2]
+
+    query_words = {
+        word.lower() for word in re.findall(r"[A-Za-z0-9]+", query or "")
+        if len(word) > 2 and word.lower() not in _QUERY_STOP_WORDS
+    }
+    if not query_words:
+        return []
+
+    ranked = []
+    for item in evidence:
+        clause_words = set(re.findall(r"[A-Za-z0-9]+", item.get("text", "").lower()))
+        overlap = query_words & clause_words
+        if overlap:
+            ranked.append((len(overlap), item))
+    ranked.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _, item in ranked[:3]]
+
+
+def _citation_for_evidence(evidence: List[Dict[str, Any]], source_indexes: List[Any]) -> str:
+    """Build citations only from retrieved contract metadata, never model output."""
+    citations = []
+    for source_index in source_indexes or []:
+        try:
+            index = int(source_index)
+        except (ValueError, TypeError, IndexError):
+            continue
+        if index < 1 or index > len(evidence):
+            continue
+        evidence_item = evidence[index - 1]
+        citation = (
+            f'[Source: "{evidence_item.get("documentName", "Contract")}", '
+            f'Page {evidence_item.get("page", "N/A")}, '
+            f'Section "{evidence_item.get("section", "N/A")}"]'
+        )
+        if citation not in citations:
+            citations.append(citation)
+    return " ".join(citations)
+
+
+def _normalise_for_match(value: Any) -> str:
+    """Normalise whitespace/case so a quoted excerpt can be verified reliably."""
+    return " ".join(str(value or "").lower().split())
+
+
+def _validated_contract_answer(parsed: Dict[str, Any], evidence: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Keep only model claims backed by a verbatim excerpt from retrieved evidence.
+
+    The model supplies an explanation, but the server verifies that each explanation
+    includes a quoted passage from the selected supplier's retrieved contract. This
+    provides a hard fail-closed boundary when an LLM returns an unsupported claim.
+    """
+    verified_claims = []
+    for claim in parsed.get("claims", []):
+        if not isinstance(claim, dict):
+            continue
+        quote = _normalise_for_match(claim.get("verbatimSupport"))
+        source_indexes = claim.get("sourceIndexes") or []
+        citation = _citation_for_evidence(evidence, source_indexes)
+        source_text = " ".join(
+            _normalise_for_match(evidence[int(i) - 1].get("text"))
+            for i in source_indexes
+            if str(i).isdigit() and 0 < int(i) <= len(evidence)
+        )
+        if quote and quote in source_text and citation:
+            # Return verified contract wording only. The citation and full source
+            # remain in the separate Evidence panel, not inside the chat answer.
+            verified_claims.append(str(claim.get("verbatimSupport")).strip())
+
+    if verified_claims:
+        return {
+            "answer": "\n\n".join(verified_claims),
+            "key_findings": [],
+            "suggested_actions": [],
+        }
+
+    return {
+        "answer": "I could not find a provision in the selected contract that supports an answer to that question.",
+        "key_findings": [],
+        "suggested_actions": [],
+    }
 
 # ---------------------------------------------------------------------------
 # Universal Contract Intelligence System Prompt
@@ -120,9 +262,9 @@ async def structured_retriever_node(state: AgentState, db: AsyncSession) -> Agen
 
 def clause_retriever_node(state: AgentState) -> AgentState:
     """Retrieve top relevant contract clauses from Qdrant vector store and BM25."""
-    supplier_id = state["supplier_id"]
+    supplier_id = state.get("supplier_id")
     task = state.get("task_type", "")
-    query = state.get("user_query", "")
+    query = (state.get("user_query") or "").strip()
 
     search_query = query
     clause_type = None
@@ -140,18 +282,27 @@ def clause_retriever_node(state: AgentState) -> AgentState:
         clause_type = "renewal_termination"
     elif task == "general_assistant":
         lower = query.lower()
-        if any(k in lower for k in ("price", "pricing", "cost", "rate", "usd", "discount", "fee", "moq", "quantity")):
+        if any(phrase in lower for phrase in (
+            "who is the supplier", "who is supplier", "who is the buyer", "who is buyer",
+            "supplier and buyer", "buyer and supplier", "contracting parties", "who are the parties",
+        )):
+            # Retrieve the agreement preamble/party definition, not clauses that
+            # merely use the generic words Buyer and Supplier.
+            search_query = "agreement between buyer supplier parties legal names"
+        elif any(k in lower for k in ("price", "pricing", "cost", "rate", "usd", "discount", "fee", "moq", "quantity")):
             clause_type = "pricing"
-        elif any(k in lower for k in ("penalty", "sla", "delay", "late", "lead time", "liquidated")):
+        elif any(k in lower for k in ("penalty", "sla", "delay", "late", "liquidated")):
             clause_type = "sla_penalty"
         elif any(k in lower for k in ("warranty", "guarantee", "defect", "remedy", "quality", "qa")):
             clause_type = "warranty"
-        elif any(k in lower for k in ("payment", "invoice", "net 30", "net 60", "advance", "deposit")):
+        elif any(k in lower for k in ("payment", "invoice", "net 30", "net 60", "net 45", "advance", "deposit")):
             clause_type = "payment_terms"
         elif any(k in lower for k in ("renew", "expiration", "terminate", "notice period", "term")):
             clause_type = "renewal_termination"
-        elif any(k in lower for k in ("law", "jurisdiction", "dispute")):
+        elif any(k in lower for k in ("law", "jurisdiction", "dispute", "arbitration")):
             clause_type = "governing_law"
+        elif any(k in lower for k in ("lead time", "delivery", "shipping", "freight", "cif", "fob", "shipment")):
+            clause_type = None
         search_query = query
 
     evidence = hybrid_retriever.retrieve(
@@ -161,8 +312,8 @@ def clause_retriever_node(state: AgentState) -> AgentState:
         top_k=6,
     )
 
-    # If clause-type filtered search returned no chunks, retrieve general chunks for this supplier
-    if not evidence or len(evidence) < 2:
+    # If clause-type filtered search returned few chunks, retrieve general chunks for this supplier
+    if not evidence or len(evidence) < 3:
         general_evidence = hybrid_retriever.retrieve(
             query=search_query or "contract obligations terms delivery payment warranty",
             supplier_id=supplier_id,
@@ -191,6 +342,28 @@ async def synthesis_node(state: AgentState) -> AgentState:
     evidence = state.get("contract_evidence", [])
     sup_name = structured.get("supplier", {}).get("supplier_name", "Supplier")
 
+    if task == "general_assistant":
+        evidence = _select_supported_evidence(query, evidence)
+        # Only relevant, selected-contract clauses are returned to the UI's
+        # separate Evidence panel.
+        state["contract_evidence"] = evidence
+        if _is_party_identity_question(query):
+            identity_answer = _extract_party_identity(evidence)
+            state["analysis_summary"] = (
+                identity_answer
+                or "I could not find explicitly labelled buyer and supplier names in the selected contract."
+            )
+            state["key_findings"] = []
+            state["suggested_actions"] = []
+            state["contract_findings"] = []
+            return state
+        if not evidence:
+            state["analysis_summary"] = "I could not find a provision in the selected contract that supports an answer to that question."
+            state["key_findings"] = []
+            state["suggested_actions"] = []
+            state["contract_findings"] = []
+            return state
+
     # Check if Groq LLM is available
     if settings.GROQ_API_KEY:
         try:
@@ -198,7 +371,8 @@ async def synthesis_node(state: AgentState) -> AgentState:
             client = AsyncGroq(api_key=settings.GROQ_API_KEY)
 
             if task == "general_assistant":
-                # Build a formatted evidence block with explicit source labels
+                # Chat is intentionally contract-only. Conversation history is not
+                # included because it can contain an earlier unsupported answer.
                 evidence_with_sources = []
                 for idx, ev in enumerate(evidence, 1):
                     evidence_with_sources.append(
@@ -207,31 +381,24 @@ async def synthesis_node(state: AgentState) -> AgentState:
                         f"Section: \"{ev.get('section', 'N/A')}\"\n"
                         f"Text: \"{ev.get('text', '')}\""
                     )
-                evidence_block = "\n\n".join(evidence_with_sources) if evidence_with_sources else "NO CONTRACT EVIDENCE AVAILABLE."
+                evidence_block = "\n\n".join(evidence_with_sources)
 
-                prompt = f"""Answer the following user question about a supplier contract.
+                # A claim is discarded server-side unless verbatimSupport appears in
+                # the cited source. Do not use supplier profiles, KPIs, market data,
+                # prior conversation, general knowledge, or unstated assumptions.
+                prompt = f"""Answer the question using ONLY the retrieved excerpts from the selected supplier contract.
 
-Use ONLY the contractual evidence and structured metrics provided below.
-Apply multi-clause reasoning: if one clause references another, combine them into a complete answer.
-Distinguish what is explicitly stated from what is missing or ambiguous.
-Do not append operational metrics (OTD, defect rates) unless the question asks about performance.
-Answer naturally: for simple questions use 1-3 sentences; for complex questions start with the conclusion then explain.
+=== CONTRACTUAL EVIDENCE ===
+{evidence_block or "NO CONTRACT CLAUSE EVIDENCE WAS RETRIEVED."}
 
-=== STRUCTURED METRICS FROM DATABASE ===
-{json.dumps(structured, indent=2)}
+QUESTION: {query}
 
-=== CONTRACTUAL EVIDENCE FROM CONTRACT DOCUMENTS ===
-{evidence_block}
+If the answer is not explicitly supported by an excerpt, return an empty claims array. Never infer missing terms or use outside knowledge. Each claim must be a concise factual answer and must include an exact, contiguous quotation from its cited source in verbatimSupport. sourceIndexes are the SOURCE numbers above.
 
-USER QUESTION: {query}
-
-Respond with a JSON object:
+Respond only with this JSON object:
 {{
-  "answer": "Direct, natural answer with inline [Source: \"document\", Page X, Section \"heading\"] citations. For simple questions, 1-3 sentences. For complex questions, conclusion first, then supporting detail.",
-  "keyFindings": ["Concrete finding with exact terms/numbers and [Source: ...] citation"],
-  "suggestedActions": ["Actionable step grounded in the contract terms found"],
-  "sources": [
-    {{"document": "string", "page": number, "section": "string"}}
+  "claims": [
+    {{"answer": "supported answer only", "sourceIndexes": [1], "verbatimSupport": "exact text copied from SOURCE 1"}}
   ]
 }}"""
                 response = await client.chat.completions.create(
@@ -244,13 +411,14 @@ Respond with a JSON object:
                     response_format={"type": "json_object"},
                 )
                 parsed = json.loads(response.choices[0].message.content)
-                state["analysis_summary"] = parsed.get("answer", parsed.get("summary", ""))
-                state["key_findings"] = parsed.get("keyFindings", [])
-                state["suggested_actions"] = parsed.get("suggestedActions", [])
-                state["sources"] = parsed.get("sources", [])
+                validated = _validated_contract_answer(parsed, evidence)
+                state["analysis_summary"] = validated["answer"]
+                state["key_findings"] = validated["key_findings"]
+                state["suggested_actions"] = validated["suggested_actions"]
+                state["sources"] = []
                 state["contract_findings"] = [
                     {"title": kf, "description": kf, "status": "info"}
-                    for kf in parsed.get("keyFindings", [])
+                    for kf in validated["key_findings"]
                 ]
                 return state
 
@@ -322,147 +490,237 @@ Respond with a JSON object:
         except Exception as e:
             logger.warning(f"Groq synthesis failed ({e}). Proceeding with expert deterministic synthesis.")
 
-    # High-quality deterministic synthesis correlating SQL metrics with Qdrant clauses
+    # High-quality factual deterministic synthesis correlating SQL metrics with Qdrant clauses
+    # ABSOLUTE RULE: Never invent contract clauses, fake percentages, or fake lead times!
+    # Without an LLM, do not attempt to paraphrase or infer. Returning the exact
+    # retrieved provisions is less conversational, but it is a safe contract-only
+    # answer and cannot introduce a fabricated contractual term.
+    if task == "general_assistant":
+        if evidence:
+            # One clause only: top-three snippets caused unrelated questions to
+            # receive the same repeated answer. The source is delivered separately.
+            state["analysis_summary"] = evidence[0].get("text", "").strip()
+            state["key_findings"] = []
+        else:
+            state["analysis_summary"] = "I could not find a provision in the selected contract that supports an answer to that question."
+            state["key_findings"] = []
+        state["suggested_actions"] = []
+        state["contract_findings"] = []
+        return state
+
     kpis = structured.get("performance_kpis", {})
     contract_info = structured.get("contract", {})
-    terms = contract_info.get("terms", {})
+    terms = contract_info.get("terms") or {}
     pricing_list = structured.get("pricing_comparison", [])
+    supplier_info = structured.get("supplier", {})
 
-    otd = kpis.get("on_time_delivery_rate_pct", 92.0)
-    defect = kpis.get("defect_rate_pct", 0.8)
-    penalty_clause = terms.get("penalty_for_delay", "1% per week of delay")
-    lead_time = terms.get("lead_time_days", 14)
-    payment_terms = terms.get("payment_terms_desc", "Net 30 days")
-    expiry = contract_info.get("expiry_date", "2026-11-15")
+    otd = kpis.get("on_time_delivery_rate_pct")
+    defect = kpis.get("defect_rate_pct")
+    penalty_clause = terms.get("penalty_for_delay")
+    lead_time = terms.get("lead_time_days")
+    payment_terms = terms.get("payment_terms_desc")
+    warranty = terms.get("warranty_months")
+    defect_days = terms.get("defect_notification_days")
+    expiry = contract_info.get("expiry_date")
+    down_payment = terms.get("payment_on_order_pct")
+    moq = terms.get("minimum_order_quantity")
 
-    # Specific deterministic answer handler for General Assistant chat
+    contact_person = supplier_info.get("contact_person")
+    contact_email = supplier_info.get("contact_email")
+    contact_phone = supplier_info.get("contact_phone")
+    location = supplier_info.get("location") or supplier_info.get("country")
+    category = supplier_info.get("category")
+
+    # Specific factual deterministic answer handler for General Assistant chat
     if task == "general_assistant":
         lower_q = query.lower()
         ans_parts = []
         findings = []
         actions = []
 
-        is_penalty = any(k in lower_q for k in ("penalty", "delay", "sla", "late", "lead time", "liquidated"))
+        is_contact = any(k in lower_q for k in ("contact", "email", "phone", "person", "address", "location", "who is", "reach"))
+        is_penalty = any(k in lower_q for k in ("penalty", "delay", "sla", "late", "liquidated"))
+        is_lead_time = any(k in lower_q for k in ("lead time", "delivery time", "shipping time", "schedule", "how long"))
         is_warranty = any(k in lower_q for k in ("warranty", "defect", "guarantee", "remedy", "quality", "qa"))
         is_payment = any(k in lower_q for k in ("payment", "invoice", "net 30", "net 60", "terms", "advance", "deposit"))
         is_pricing = any(k in lower_q for k in ("price", "pricing", "cost", "benchmark", "product", "moq", "rate"))
         is_renewal = any(k in lower_q for k in ("renew", "expiry", "expiration", "terminate", "notice"))
+        is_performance = any(k in lower_q for k in ("performance", "otd", "on-time", "defect rate", "kpi", "spend", "order"))
+
+        if is_contact:
+            parts = []
+            if contact_person:
+                parts.append(f"Contact Person: {contact_person}")
+            if contact_email:
+                parts.append(f"Email: {contact_email}")
+            if contact_phone:
+                parts.append(f"Phone: {contact_phone}")
+            if location:
+                parts.append(f"Location: {location}")
+            if parts:
+                ans_parts.append(f"Contact details for {sup_name}: " + ", ".join(parts) + ". [Source: Supplier Profile]")
+                findings.extend(parts)
+            else:
+                ans_parts.append(f"No specific contact details are recorded in the system for {sup_name}.")
 
         if is_penalty:
-            ans_parts.append(
-                f"Under the contract for {sup_name}, the agreed delivery SLA stipulates a {lead_time}-day lead time. "
-                f"In the event of delivery delays, Section 8 establishes a penalty of {penalty_clause}. "
-                f"Currently, {sup_name}'s recorded on-time delivery rate is {otd}%, with an average delay of {kpis.get('avg_delay_days', 0)} days."
-            )
-            findings.append(f"Delivery Penalty: {penalty_clause}")
-            findings.append(f"Agreed Lead Time: {lead_time} business days")
-            actions.append("Review whether delayed purchase orders qualify for contractual penalty deductions.")
+            if penalty_clause:
+                ans_parts.append(f"Under the contract for {sup_name}, the late delivery penalty is {penalty_clause}.")
+                findings.append(f"Delay Penalty: {penalty_clause}")
+                actions.append("Review whether delayed orders qualify for contractual penalty deductions.")
+            else:
+                ans_parts.append(f"No delay penalty clause is recorded in the contract or system for {sup_name}.")
+                findings.append(f"Delay Penalty: None recorded for {sup_name}")
+
+        if is_lead_time:
+            if lead_time is not None:
+                ans_parts.append(f"The agreed delivery SLA lead time is {lead_time} days for {sup_name}.")
+                findings.append(f"Lead Time: {lead_time} days")
+            else:
+                ans_parts.append(f"No contractual delivery lead time is specified in the available records for {sup_name}.")
+                findings.append("Lead Time: Not specified in contract")
 
         if is_warranty:
-            ans_parts.append(
-                f"The contractual warranty period under Section 9 is {terms.get('warranty_months', '24 months')} standard coverage, "
-                f"with a mandatory {terms.get('defect_notification_days', 30)}-day defect reporting window. "
-                f"Current recorded quality defect rate is {defect}%."
-            )
-            findings.append(f"Warranty Period: {terms.get('warranty_months', '24 months')}")
-            findings.append(f"Defect Reporting Window: {terms.get('defect_notification_days', 30)} days")
-            actions.append("Ensure QA inspection reports are formally submitted within the 30-day reporting window.")
+            if warranty:
+                detail = f"The contractual warranty period for {sup_name} is {warranty}"
+                if defect_days:
+                    detail += f" with a {defect_days}-day defect notification window"
+                ans_parts.append(detail + ".")
+                findings.append(f"Warranty: {warranty}")
+            else:
+                ans_parts.append(f"No warranty clause is specified in the available contract records for {sup_name}.")
+                findings.append("Warranty: Not specified in contract")
 
         if is_payment:
-            ans_parts.append(
-                f"Agreed payment terms are '{payment_terms}'. Down payment is {terms.get('payment_on_order_pct', 15)}% on order placement, "
-                f"and {terms.get('payment_before_shipment_pct', 85)}% upon QA inspection prior to shipment."
-            )
-            findings.append(f"Payment Terms: {payment_terms}")
-            findings.append(f"Advance Deposit: {terms.get('payment_on_order_pct', 15)}%")
-            actions.append("Verify accounting reconciliation against milestone payment schedule.")
+            if payment_terms:
+                detail = f"The agreed payment terms for {sup_name} are '{payment_terms}'"
+                if down_payment is not None:
+                    detail += f" with a {down_payment}% deposit"
+                ans_parts.append(detail + ".")
+                findings.append(f"Payment Terms: {payment_terms}")
+            else:
+                ans_parts.append(f"Payment terms are not specified in the contract records for {sup_name}.")
+                findings.append("Payment Terms: Not specified in contract")
 
         if is_pricing:
-            price_details = ", ".join(
-                f"{p.get('product_name')}: ${p.get('contracted_price', 0):.2f} (Benchmark: ${p.get('market_benchmark_price', 0):.2f})"
-                for p in pricing_list[:3]
-            ) or "contracted unit pricing"
-            ans_parts.append(
-                f"Contracted pricing includes: {price_details}. Minimum order quantity is {terms.get('minimum_order_quantity', 100)} units."
-            )
-            findings.append(f"MOQ: {terms.get('minimum_order_quantity', 100)} units")
-            actions.append("Evaluate volume discount thresholds for upcoming purchase orders.")
+            if pricing_list:
+                price_details = ", ".join(
+                    f"{p.get('product_name')}: ${p.get('contracted_price', 0):.2f}"
+                    for p in pricing_list[:3]
+                )
+                ans_parts.append(f"Contracted pricing includes: {price_details}.")
+                if moq:
+                    ans_parts.append(f"Minimum order quantity is {moq} units.")
+                    findings.append(f"MOQ: {moq} units")
+            else:
+                ans_parts.append(f"No itemized product pricing is on file for {sup_name}.")
 
         if is_renewal:
-            ans_parts.append(
-                f"The contract agreement for {sup_name} is active and set to expire on {expiry}. "
-                f"Renewal terms require {terms.get('renewal_type', 'mutual written consent')} with a {terms.get('termination_notice_months', 2)}-month notice period."
-            )
-            findings.append(f"Contract Expiry: {expiry}")
-            findings.append(f"Renewal Notice: {terms.get('termination_notice_months', 2)} months")
-            actions.append("Initiate formal supplier review 60 days prior to contract expiration.")
+            if expiry:
+                renewal_type = terms.get("renewal_type") or "standard terms"
+                notice_m = terms.get("termination_notice_months")
+                notice_str = f" with {notice_m}-month notice" if notice_m else ""
+                ans_parts.append(f"The contract agreement for {sup_name} expires on {expiry} ({renewal_type}{notice_str}).")
+                findings.append(f"Contract Expiry: {expiry}")
+            else:
+                ans_parts.append(f"No active contract expiration date is recorded for {sup_name}.")
+
+        if is_performance and (otd is not None or defect is not None):
+            perf_items = []
+            if otd is not None:
+                perf_items.append(f"On-Time Delivery rate is {otd}%")
+            if defect is not None:
+                perf_items.append(f"Quality defect rate is {defect}%")
+            if kpis.get("total_orders"):
+                perf_items.append(f"Total POs: {kpis.get('total_orders')}")
+            ans_parts.append(f"Recorded performance for {sup_name}: " + ", ".join(perf_items) + ".")
 
         if not ans_parts:
             if evidence:
                 chunk_texts = " ".join(e.get("text", "") for e in evidence[:2])
                 ans_parts.append(
-                    f"Regarding your query about {sup_name}: According to relevant contract clauses ({evidence[0].get('section', 'Contract Clause')}), "
-                    f"\"{chunk_texts[:350]}...\". Current supplier performance reflects an OTD of {otd}% and defect rate of {defect}%."
+                    f"Regarding your query about {sup_name}: According to contract records ({evidence[0].get('section', 'Contract Clause')}), "
+                    f"\"{chunk_texts[:300]}...\" [Source: \"{evidence[0].get('documentName', 'Contract')}\", Page {evidence[0].get('page', 1)}, Section \"{evidence[0].get('section', 'General')}\"]"
+                )
+            elif contract_info:
+                ans_parts.append(
+                    f"{sup_name}'s contract ({contract_info.get('contract_title', 'Agreement')}) is currently {contract_info.get('status', 'active')}. "
+                    f"No specific clause regarding your query was identified in the indexed sections."
                 )
             else:
                 ans_parts.append(
-                    f"{sup_name}'s contract is currently {contract_info.get('status', 'active')}. "
-                    f"Key clauses enforce a {lead_time}-day delivery SLA ({penalty_clause}) and {terms.get('warranty_months', '24 months')} warranty. "
-                    f"Current on-time fulfillment is {otd}% and defect rate is {defect}%."
+                    f"{sup_name} is currently registered in {location or 'system'} under category '{category or 'General'}'. "
+                    f"No contract documents are currently attached to this supplier partner."
                 )
-            findings.append(f"Status: {contract_info.get('status', 'active').capitalize()}")
-            findings.append(f"Compliance: {otd}% OTD, {defect}% defect rate")
-            actions.append("Consult full contractual clauses for additional specific stipulations.")
 
         summary = "\n\n".join(ans_parts)
         state["analysis_summary"] = summary
-        state["key_findings"] = findings or [f"Active agreement for {sup_name}"]
-        state["suggested_actions"] = actions or ["Review agreement documentation with procurement lead."]
+        state["key_findings"] = findings or [f"Supplier: {sup_name}"]
+        state["suggested_actions"] = actions or ["Consult contract documentation for further specifics."]
         state["contract_findings"] = [
             {"title": f, "description": f, "status": "info"} for f in (findings or [])
         ]
         return state
 
-    # Contract findings for dashboard review
-    contract_findings = [
-        {
+    # Contract findings for dashboard review (truthful, no fabrication)
+    contract_findings = []
+    if lead_time is not None:
+        contract_findings.append({
             "title": "Lead Time & Delivery Obligation",
-            "description": f"Contract stipulates a {lead_time}-day lead time with liquidated damages of {penalty_clause}.",
-            "status": "compliant" if otd >= 90 else "warning",
-        },
-        {
+            "description": f"Contract stipulates a {lead_time}-day lead time" + (f" with delay penalty of {penalty_clause}." if penalty_clause else "."),
+            "status": "compliant" if (otd is not None and otd >= 90) else "info",
+        })
+    elif penalty_clause:
+        contract_findings.append({
+            "title": "Delivery Delay Penalties",
+            "description": f"Late delivery penalty: {penalty_clause}.",
+            "status": "info",
+        })
+
+    if payment_terms:
+        contract_findings.append({
             "title": "Payment Terms & Invoicing",
-            "description": f"Contractual terms are '{payment_terms}'. Down payment is {terms.get('payment_on_order_pct', 15)}% on order.",
+            "description": f"Contractual payment terms: '{payment_terms}'" + (f" ({down_payment}% on order)." if down_payment else "."),
             "status": "compliant",
-        },
-        {
+        })
+
+    if warranty:
+        contract_findings.append({
             "title": "Warranty & Defect Remedies",
-            "description": f"Warranty period is {terms.get('warranty_months', '24 months')} with a {terms.get('defect_notification_days', 30)}-day reporting window.",
-            "status": "compliant" if defect < 2.0 else "warning",
-        },
-    ]
+            "description": f"Warranty period is {warranty}" + (f" with a {defect_days}-day reporting window." if defect_days else "."),
+            "status": "compliant" if (defect is not None and defect < 2.0) else "info",
+        })
+
+    if not contract_findings:
+        contract_findings.append({
+            "title": "Contract Status",
+            "description": f"Contract on file: {contract_info.get('contract_title', 'No contract title')}" if contract_info else "No formal contract terms recorded in system.",
+            "status": "info",
+        })
 
     # Performance findings
-    performance_findings = [
-        {
-            "metric": "On-Time Delivery Rate",
-            "actual": f"{otd}%",
-            "target": "95.0%",
-            "status": "on_target" if otd >= 95 else ("below_target" if otd >= 85 else "critical"),
-        },
-        {
-            "metric": "Quality Defect Rate",
-            "actual": f"{defect}%",
-            "target": "< 1.0%",
-            "status": "on_target" if defect <= 1.0 else "below_target",
-        },
-        {
-            "metric": "Average Delivery Delay",
-            "actual": f"{kpis.get('avg_delay_days', 0)} days",
-            "target": "0 days",
-            "status": "on_target" if kpis.get("avg_delay_days", 0) <= 2 else "critical",
-        },
-    ]
+    performance_findings = []
+    if otd is not None:
+        performance_findings.extend([
+            {
+                "metric": "On-Time Delivery Rate",
+                "actual": f"{otd}%",
+                "target": "95.0%",
+                "status": "on_target" if otd >= 95 else ("below_target" if otd >= 85 else "critical"),
+            },
+            {
+                "metric": "Quality Defect Rate",
+                "actual": f"{defect}%" if defect is not None else "N/A",
+                "target": "< 1.0%",
+                "status": "on_target" if (defect is not None and defect <= 1.0) else "below_target",
+            },
+            {
+                "metric": "Average Delivery Delay",
+                "actual": f"{kpis.get('avg_delay_days', 0)} days",
+                "target": "0 days",
+                "status": "on_target" if kpis.get("avg_delay_days", 0) <= 2 else "critical",
+            },
+        ])
 
     # Pricing findings
     pricing_findings = []

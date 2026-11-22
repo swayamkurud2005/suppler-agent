@@ -70,9 +70,11 @@ async def health_check():
         "version": settings.APP_VERSION,
         "timestamp": datetime.now().isoformat(),
         "vector_store_chunks": len(vector_store._memory_chunks),
+        "vector_backend": "qdrant" if vector_store.client else "memory_only",
     }
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.environ.get("PORT", 8010))
+    uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=True)

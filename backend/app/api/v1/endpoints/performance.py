@@ -19,13 +19,10 @@ async def get_supplier_performance(supplier_id: str, db: AsyncSession = Depends(
     kpis = await sql_retriever.get_performance_kpis(db, supplier_id)
     trends = await sql_retriever.get_monthly_performance_trends(db, supplier_id)
 
-    otd = kpis.get("on_time_delivery_rate_pct", 92.0)
-    defect = kpis.get("defect_rate_pct", 0.8)
-    total_deliv = kpis.get("total_deliveries", 4)
-    total_orders = kpis.get("total_orders", 4)
-    total_inspected = kpis.get("total_inspected", 450)
-    total_defective = kpis.get("total_defective", 3)
-    avg_delay = kpis.get("avg_delay_days", 1.5)
+    otd = kpis.get("on_time_delivery_rate_pct", 0.0); defect = kpis.get("defect_rate_pct", 0.0)
+    total_deliv = kpis.get("total_deliveries", 0); total_orders = kpis.get("total_orders", 0)
+    total_inspected = kpis.get("total_inspected", 0); total_defective = kpis.get("total_defective", 0)
+    avg_delay = kpis.get("avg_delay_days", 0.0)
 
     on_time_count = int(round(total_deliv * (otd / 100.0)))
     late_count = max(0, total_deliv - on_time_count)
@@ -41,20 +38,20 @@ async def get_supplier_performance(supplier_id: str, db: AsyncSession = Depends(
         "returnRate": defect,
         "qualityScore": round(100.0 - defect, 1),
         "slaBreaches": late_count,
-        "averageLeadTimeDays": 14,
+        "averageLeadTimeDays": 0,
         "averageDelayDays": avg_delay,
         "deliveryTrend": delivery_trend,
         "qualityTrend": quality_trend,
         "priceTrend": "stable",
         "totalOrders": total_orders,
-        "totalSpend": kpis.get("total_spend", 135025.0),
+        "totalSpend": kpis.get("total_spend", 0.0),
         "totalUnitsReceived": total_inspected,
         "defectiveUnits": total_defective,
         "qualityComplaints": 1 if total_defective > 0 else 0,
         "returns": 1 if total_defective > 0 else 0,
         "lateDeliveries": late_count,
         "onTimeDeliveries": on_time_count,
-        "fulfillmentRate": 98.5 if total_orders > 0 else 100.0,
+        "fulfillmentRate": 0.0,
         "cancellationRate": 0.0,
         "monthlyTrend": trends,
         "trends": trends,
@@ -71,13 +68,10 @@ async def get_all_performance(db: AsyncSession = Depends(get_db)):
     all_perf = []
     for sid in supplier_ids:
         kpis = await sql_retriever.get_performance_kpis(db, sid)
-        otd = kpis.get("on_time_delivery_rate_pct", 92.0)
-        defect = kpis.get("defect_rate_pct", 0.8)
-        total_deliv = kpis.get("total_deliveries", 4)
-        total_orders = kpis.get("total_orders", 4)
-        total_inspected = kpis.get("total_inspected", 450)
-        total_defective = kpis.get("total_defective", 3)
-        avg_delay = kpis.get("avg_delay_days", 1.5)
+        otd = kpis.get("on_time_delivery_rate_pct", 0.0); defect = kpis.get("defect_rate_pct", 0.0)
+        total_deliv = kpis.get("total_deliveries", 0); total_orders = kpis.get("total_orders", 0)
+        total_inspected = kpis.get("total_inspected", 0); total_defective = kpis.get("total_defective", 0)
+        avg_delay = kpis.get("avg_delay_days", 0.0)
 
         on_time_count = int(round(total_deliv * (otd / 100.0)))
         late_count = max(0, total_deliv - on_time_count)
@@ -93,20 +87,20 @@ async def get_all_performance(db: AsyncSession = Depends(get_db)):
             "returnRate": defect,
             "qualityScore": round(100.0 - defect, 1),
             "slaBreaches": late_count,
-            "averageLeadTimeDays": 14,
+            "averageLeadTimeDays": 0,
             "averageDelayDays": avg_delay,
             "deliveryTrend": delivery_trend,
             "qualityTrend": quality_trend,
             "priceTrend": "stable",
             "totalOrders": total_orders,
-            "totalSpend": kpis.get("total_spend", 135025.0),
+            "totalSpend": kpis.get("total_spend", 0.0),
             "totalUnitsReceived": total_inspected,
             "defectiveUnits": total_defective,
             "qualityComplaints": 1 if total_defective > 0 else 0,
             "returns": 1 if total_defective > 0 else 0,
             "lateDeliveries": late_count,
             "onTimeDeliveries": on_time_count,
-            "fulfillmentRate": 98.5 if total_orders > 0 else 100.0,
+            "fulfillmentRate": 0.0,
             "cancellationRate": 0.0,
         })
 

@@ -15,7 +15,7 @@ from app.core.database import async_session_factory, engine, Base
 from app.models.models import (
     Supplier, Contract, ContractTerms, Product, ContractProduct,
     PurchaseOrder, PurchaseOrderItem, Delivery, QualityRecord,
-    MarketPriceBenchmark, DocumentIngestionLog
+    MarketPriceBenchmark, DocumentIngestionLog, ChatSession, ChatMessage
 )
 
 

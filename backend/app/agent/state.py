@@ -6,9 +6,10 @@ from typing import TypedDict, List, Dict, Any, Optional
 
 
 class AgentState(TypedDict, total=False):
-    supplier_id: str
+    supplier_id: Optional[str]
     task_type: str  # contract_analysis | performance_review | pricing_analysis | renewal_review | general_assistant
-    user_query: str
+    user_query: str  # Clean query for retrieval and routing
+    conversation_history: Optional[str]  # Multi-turn context for synthesis
     router_decision: str  # structured_only | unstructured_only | hybrid
     structured_data: Dict[str, Any]
     contract_evidence: List[Dict[str, Any]]

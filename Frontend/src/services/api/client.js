@@ -33,7 +33,14 @@ export async function apiClient(endpoint, options = {}) {
 
     if (!response.ok) {
       console.warn(`[API] HTTP ${response.status} from ${url}`);
-      return { status: 'error', data: null, message: `Server error: ${response.statusText}` };
+      let message = `Server error: ${response.statusText}`;
+      try {
+        const errorBody = await response.json();
+        message = errorBody.detail || errorBody.message || message;
+      } catch (_) {
+        // Some proxies return a non-JSON error body; retain the HTTP message.
+      }
+      return { status: 'error', data: null, message };
     }
 
     const data = await response.json();
@@ -67,6 +74,10 @@ export async function apiPost(endpoint, body = {}) {
     method: 'POST',
     body: JSON.stringify(body),
   });
+}
+
+export async function apiDelete(endpoint) {
+  return apiClient(endpoint, { method: 'DELETE' });
 }
 
 export async function apiUpload(endpoint, formData) {

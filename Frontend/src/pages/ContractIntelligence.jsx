@@ -3,6 +3,7 @@ import { useOutletContext, Link } from 'react-router-dom';
 import { FileText, Download, Clock, IndianRupee, Truck, ShieldCheck, AlertCircle, Upload } from 'lucide-react';
 import { StatusBadge, EvidenceModal } from '../components/ui';
 import { getContractBySupplier, getEvidence } from '../services';
+import { API_BASE_URL } from '../services/api/client';
 
 export default function ContractIntelligence() {
   const { supplier } = useOutletContext();
@@ -228,9 +229,9 @@ export default function ContractIntelligence() {
                   </div>
                 </div>
                 <div>
-                  <button className="btn btn-secondary btn-sm">
+                  {doc.downloadUrl ? <a href={`${API_BASE_URL}${doc.downloadUrl}`} className="btn btn-secondary btn-sm" download>
                     <Download size={14} /> Download
-                  </button>
+                  </a> : <span className="text-sm text-gray-500">Original file unavailable</span>}
                 </div>
               </div>
             ))}

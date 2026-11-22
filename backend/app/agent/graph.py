@@ -29,12 +29,14 @@ class ProcurementWorkflow:
         task_type: str,
         user_query: str,
         db: AsyncSession,
+        conversation_history: str = None,
     ) -> Dict[str, Any]:
         """Run all workflow nodes with error resilience."""
         state: AgentState = {
             "supplier_id": supplier_id,
             "task_type": task_type,
             "user_query": user_query,
+            "conversation_history": conversation_history,
             "structured_data": {},
             "contract_evidence": [],
             "status": "processing",

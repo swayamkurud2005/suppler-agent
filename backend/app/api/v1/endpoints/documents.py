@@ -33,9 +33,10 @@ async def upload_contract_document(
             file_bytes=content,
             supplier_id=supplier_id,
         )
-        return APIResponse(status="success", data=result, message="Contract successfully ingested and indexed")
+        status = "duplicate" if result.get("status") == "duplicate" else "success"
+        return APIResponse(status=status, data=result, message=result.get("message") or "Contract successfully ingested and indexed")
     except Exception as e:
-        return APIResponse(status="error", message=f"Ingestion failed: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Ingestion failed: {str(e)}")
 
 
 @router.get("", response_model=APIResponse)

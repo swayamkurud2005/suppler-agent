@@ -7,7 +7,7 @@ structured PostgreSQL data with hybrid Qdrant contract evidence.
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel
-from fastapi import APIRouter, Depends, Body
+from fastapi import APIRouter, Depends, Body, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -41,7 +41,9 @@ async def run_supplier_analysis(
     Executes LangGraph agent workflow for contract, performance, pricing, or renewal analysis.
     Combines SQL relational facts with Qdrant vector evidence.
     """
-    supplier_id = req.supplierId or req.supplier_id or "SUP-001"
+    supplier_id = req.supplierId or req.supplier_id
+    if not supplier_id:
+        raise HTTPException(status_code=400, detail="A supplier must be selected before running an analysis.")
     task = req.analysisType or req.analysis_type or analysis_type or "contract_analysis"
 
     result = await procurement_workflow.execute(
@@ -72,9 +74,11 @@ async def query_supplier_assistant(
 ):
     """
     Supplier AI Assistant interactive query.
-    Extracts answers grounded in both SQL tables and contract evidence.
+    Answers only from evidence retrieved for the selected supplier contract.
     """
-    supplier_id = req.supplierId or req.supplier_id or "SUP-001"
+    supplier_id = req.supplierId or req.supplier_id
+    if not supplier_id:
+        raise HTTPException(status_code=400, detail="A supplier must be selected for contract-only assistant answers.")
     message = req.message
 
     result = await procurement_workflow.execute(

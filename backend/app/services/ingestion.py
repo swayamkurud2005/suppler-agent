@@ -37,37 +37,59 @@ class IngestionService:
         start_time = time.time()
         os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
 
+        if not supplier_id:
+            raise ValueError("supplier_id is required")
+        supplier = (await db.execute(select(Supplier).where(Supplier.supplier_id == supplier_id))).scalars().first()
+        if not supplier:
+            raise ValueError("Supplier not found; create the supplier before uploading a contract")
+        if not file_bytes:
+            raise ValueError("The uploaded file is empty")
+        if len(file_bytes) > settings.max_upload_bytes:
+            raise ValueError(f"File exceeds the {settings.MAX_UPLOAD_SIZE_MB} MB upload limit")
+        extension = os.path.splitext(filename)[1].lower()
+        if extension not in {".pdf", ".docx", ".txt"}:
+            raise ValueError("Only PDF, DOCX, and TXT contract files are supported")
+
         # 1. Compute Hash and Check Duplication
         doc_hash = calculate_file_hash(file_bytes)
         existing_stmt = select(Contract).where(Contract.document_hash == doc_hash)
         existing_contract = (await db.execute(existing_stmt)).scalars().first()
+        if existing_contract:
+            if existing_contract.supplier_id != supplier_id:
+                raise ValueError("This document is already associated with a different supplier")
+            return {
+                "status": "duplicate",
+                "contract_id": existing_contract.contract_id,
+                "document_name": filename,
+                "chunks_indexed": 0,
+                "fields_extracted": 0,
+                "processing_time_seconds": round(time.time() - start_time, 2),
+                "message": "This contract was already ingested; existing vectors were retained.",
+            }
 
         contract_id = f"CTR-{uuid.uuid4().hex[:8].upper()}"
         save_path = os.path.join(settings.UPLOAD_DIR, f"{contract_id}_{filename}")
         with open(save_path, "wb") as f:
             f.write(file_bytes)
 
-        # 2. Parse Pages
+        # 2. Parse Pages before any vector writes.
         pages = parse_document(filename, file_bytes)
         full_text = "\n\n".join(p["text"] for p in pages)
+        if not full_text.strip():
+            raise ValueError("No extractable text was found in the uploaded document")
 
-        # 3. Create Chunks and Index in Vector Store
+        # 3. Create chunks. Index only after the relational record is durable.
         chunks = chunk_pages(
             pages=pages,
             contract_id=contract_id,
             supplier_id=supplier_id,
             document_name=filename,
         )
-        vector_store.upsert_chunks(chunks)
-
-        # 4. Extract Structured Terms via LLM/Regex
-        supplier_stmt = select(Supplier).where(Supplier.supplier_id == supplier_id)
-        supplier = (await db.execute(supplier_stmt)).scalars().first()
         supplier_name = supplier.supplier_name if supplier else ""
 
         extracted = await extract_contract_terms(full_text, supplier_name)
 
-        # 5. Save Contract Record to PostgreSQL
+        # 4. Save Contract Record to PostgreSQL
         contract = Contract(
             contract_id=contract_id,
             supplier_id=supplier_id,
@@ -83,13 +105,15 @@ class IngestionService:
             governing_law=extracted.get("governing_law", "Standard jurisdiction"),
             contract_status="active",
             document_path=save_path,
+            document_data=file_bytes,
+            document_filename=filename,
             document_hash=doc_hash,
             extraction_status="completed",
         )
         db.add(contract)
         await db.flush()
 
-        # 6. Save Terms
+        # 5. Save Terms
         terms = ContractTerms(
             contract_id=contract.contract_id,
             payment_on_order_pct=Decimal(str(extracted.get("payment_on_order_pct", 15.0))),
@@ -104,7 +128,7 @@ class IngestionService:
         )
         db.add(terms)
 
-        # 7. Ingestion Log
+        # 6. Ingestion Log and then vector indexing.
         duration = round(Decimal(str(time.time() - start_time)), 2)
         log = DocumentIngestionLog(
             contract_id=contract.contract_id,
@@ -118,12 +142,23 @@ class IngestionService:
         )
         db.add(log)
         await db.commit()
+        try:
+            indexed_count = vector_store.upsert_chunks(chunks)
+        except Exception:
+            # Preserve the contract but expose a truthful retryable state.
+            log.status = "failed"
+            log.step = "vector_indexing"
+            await db.commit()
+            raise
+
+        log.chunks_indexed = indexed_count
+        await db.commit()
 
         return {
             "status": "success",
             "contract_id": contract.contract_id,
             "document_name": filename,
-            "chunks_indexed": len(chunks),
+            "chunks_indexed": indexed_count,
             "fields_extracted": len(extracted),
             "processing_time_seconds": float(duration),
             "extracted_terms": extracted,

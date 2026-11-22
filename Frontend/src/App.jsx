@@ -9,6 +9,8 @@ import Dashboard from './pages/Dashboard';
 import SuppliersList from './pages/SuppliersList';
 import SupplierComparison from './pages/SupplierComparison';
 import Documents from './pages/Documents';
+import AIAssistant from './pages/AIAssistant';
+import ContractsRepository from './pages/ContractsRepository';
 
 // Supplier 360 Sub-pages
 import SupplierOverview from './pages/SupplierOverview';
@@ -26,7 +28,9 @@ function App() {
           <Route index element={<Dashboard />} />
           <Route path="suppliers" element={<SuppliersList />} />
           <Route path="comparison" element={<SupplierComparison />} />
+          <Route path="contracts" element={<ContractsRepository />} />
           <Route path="documents" element={<Documents />} />
+          <Route path="assistant" element={<AIAssistant />} />
           
           <Route path="suppliers/:id" element={<Supplier360Layout />}>
             <Route index element={<Navigate to="overview" replace />} />

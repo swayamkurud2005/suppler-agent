@@ -2,10 +2,53 @@ import { useState, useRef, useEffect } from 'react';
 import { useOutletContext, Link } from 'react-router-dom';
 import { 
   FileText, BarChart3, IndianRupee, RefreshCw, MessageSquare, 
-  Send, CheckCircle, AlertTriangle, Info, Bot, Upload, Sparkles
+  Send, CheckCircle, AlertTriangle, Info, Bot, Upload, Sparkles,
+  Plus, Search, Trash2, Edit3, MoreHorizontal, FolderOpen, Check, X,
+  ExternalLink
 } from 'lucide-react';
 import { EvidenceModal } from '../components/ui';
-import { runAnalysis, sendAssistantMessage, getContractBySupplier } from '../services';
+import MarketPriceBenchmarking from '../components/pricing/MarketPriceBenchmarking';
+import { 
+  runAnalysis, 
+  sendAssistantMessage, 
+  getContractBySupplier,
+  getChatSessions,
+  createChatSession,
+  getSessionMessages,
+  sendSessionMessage,
+  renameChatSession,
+  deleteChatSession,
+} from '../services';
+
+function groupSessionsByDate(sessions) {
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const yesterday = new Date(today);
+  yesterday.setDate(yesterday.getDate() - 1);
+  const last7 = new Date(today);
+  last7.setDate(last7.getDate() - 7);
+  const last30 = new Date(today);
+  last30.setDate(last30.getDate() - 30);
+
+  const groups = {
+    'Today': [],
+    'Yesterday': [],
+    'Previous 7 Days': [],
+    'Previous 30 Days': [],
+    'Older': [],
+  };
+
+  for (const s of sessions) {
+    const d = new Date(s.updated_at || s.created_at);
+    if (d >= today) groups['Today'].push(s);
+    else if (d >= yesterday) groups['Yesterday'].push(s);
+    else if (d >= last7) groups['Previous 7 Days'].push(s);
+    else if (d >= last30) groups['Previous 30 Days'].push(s);
+    else groups['Older'].push(s);
+  }
+
+  return Object.entries(groups).filter(([, items]) => items.length > 0);
+}
 
 export default function AIAnalysis() {
   const { supplier } = useOutletContext();
@@ -14,8 +57,17 @@ export default function AIAnalysis() {
   const [loading, setLoading] = useState(false);
   const [activeContract, setActiveContract] = useState(null);
   
-  // Chat state
+  // Chat state with persistent history & ChatGPT-style sidebar
   const [chatOpen, setChatOpen] = useState(false);
+  const [sessions, setSessions] = useState([]);
+  const [activeSessionId, setActiveSessionId] = useState(null);
+  const [sessionsLoading, setSessionsLoading] = useState(false);
+  const [messagesLoading, setMessagesLoading] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [editingSessionId, setEditingSessionId] = useState(null);
+  const [editTitle, setEditTitle] = useState('');
+  const [contextMenuSessionId, setContextMenuSessionId] = useState(null);
+
   const [messages, setMessages] = useState([
     { 
       role: 'assistant', 
@@ -26,11 +78,122 @@ export default function AIAnalysis() {
   const [inputMessage, setInputMessage] = useState('');
   const [isTyping, setIsTyping] = useState(false);
   const messagesEndRef = useRef(null);
+  const inputRef = useRef(null);
 
   // Evidence Modal State
   const [evidenceModalOpen, setEvidenceModalOpen] = useState(false);
   const [evidenceData, setEvidenceData] = useState([]);
   const [evidenceTitle, setEvidenceTitle] = useState('');
+
+  // Close context menu on click outside
+  useEffect(() => {
+    const handler = () => setContextMenuSessionId(null);
+    document.addEventListener('click', handler);
+    return () => document.removeEventListener('click', handler);
+  }, []);
+
+  // Load chat sessions when chat is opened
+  useEffect(() => {
+    if (chatOpen) {
+      loadSessions();
+    }
+  }, [chatOpen, supplier.id]);
+
+  const loadSessions = async () => {
+    setSessionsLoading(true);
+    try {
+      const res = await getChatSessions(supplier.id);
+      if (res.status === 'success' && res.data) {
+        setSessions(res.data);
+      }
+    } catch (err) {
+      console.error('Failed to load sessions:', err);
+    } finally {
+      setSessionsLoading(false);
+    }
+  };
+
+  const loadSessionMessages = async (sessionId) => {
+    setMessagesLoading(true);
+    try {
+      const res = await getSessionMessages(sessionId);
+      if (res.status === 'success' && res.data) {
+        const loaded = res.data.messages.map(m => ({
+          role: m.role,
+          content: m.content,
+          keyFindings: m.key_findings || [],
+          evidence: m.evidence || [],
+          suggestedActions: m.suggested_actions || [],
+          timestamp: m.timestamp,
+        }));
+        setMessages(loaded.length > 0 ? loaded : [
+          {
+            role: 'assistant',
+            content: `Resumed chat about ${supplier.name}. What would you like to explore?`,
+            timestamp: new Date().toISOString(),
+          }
+        ]);
+      }
+    } catch (err) {
+      console.error('Failed to load messages:', err);
+    } finally {
+      setMessagesLoading(false);
+    }
+  };
+
+  const handleSelectSession = async (sessionId) => {
+    setActiveSessionId(sessionId);
+    setContextMenuSessionId(null);
+    await loadSessionMessages(sessionId);
+  };
+
+  const handleNewChat = () => {
+    setActiveSessionId(null);
+    setMessages([
+      {
+        role: 'assistant',
+        content: `New chat started for ${supplier.name}. Ask me anything about contracts, delivery SLAs, payment terms, or pricing!`,
+        timestamp: new Date().toISOString(),
+      }
+    ]);
+    setTimeout(() => inputRef.current?.focus(), 100);
+  };
+
+  const handleDeleteSession = async (sessionId) => {
+    try {
+      await deleteChatSession(sessionId);
+      setSessions(prev => prev.filter(s => s.session_id !== sessionId));
+      if (activeSessionId === sessionId) {
+        handleNewChat();
+      }
+    } catch (err) {
+      console.error('Failed to delete session:', err);
+    }
+    setContextMenuSessionId(null);
+  };
+
+  const handleStartRename = (session) => {
+    setEditingSessionId(session.session_id);
+    setEditTitle(session.title);
+    setContextMenuSessionId(null);
+  };
+
+  const handleSaveRename = async () => {
+    if (editingSessionId && editTitle.trim()) {
+      try {
+        await renameChatSession(editingSessionId, editTitle.trim());
+        setSessions(prev =>
+          prev.map(s =>
+            s.session_id === editingSessionId ? { ...s, title: editTitle.trim() } : s
+          )
+        );
+      } catch (err) {
+        console.error('Failed to rename session:', err);
+      }
+    }
+    setEditingSessionId(null);
+    setEditTitle('');
+  };
 
   useEffect(() => {
     async function checkContract() {
@@ -61,6 +224,10 @@ export default function AIAnalysis() {
 
   const handleRunAnalysis = async (type) => {
     setActiveAnalysis(type);
+    if (type === 'pricing_analysis') {
+      // Handled directly by MarketPriceBenchmarking component
+      return;
+    }
     setLoading(true);
     setAnalysisResult(null);
     
@@ -78,11 +245,12 @@ export default function AIAnalysis() {
 
   const handleSendMessage = async (e) => {
     e.preventDefault();
-    if (!inputMessage.trim()) return;
+    if (!inputMessage.trim() || isTyping) return;
 
     const userMsg = inputMessage.trim();
     setInputMessage('');
     
+    // Add user message to UI immediately
     setMessages(prev => [...prev, {
       role: 'user',
       content: userMsg,
@@ -92,9 +260,47 @@ export default function AIAnalysis() {
     setIsTyping(true);
     
     try {
-      const res = await sendAssistantMessage(supplier.id, userMsg);
-      if (res.status === 'success') {
-        setMessages(prev => [...prev, res.data]);
+      let sessionId = activeSessionId;
+
+      // Auto-create session if none active
+      if (!sessionId) {
+        const createRes = await createChatSession(supplier.id, supplier.name, userMsg.slice(0, 50));
+        if (createRes.status === 'success' && createRes.data) {
+          sessionId = createRes.data.session_id;
+          setActiveSessionId(sessionId);
+          setSessions(prev => [createRes.data, ...prev]);
+        }
+      }
+
+      // Send message within session to persist both turns
+      if (sessionId) {
+        const res = await sendSessionMessage(sessionId, userMsg, supplier.id);
+        if (res.status === 'success' && res.data) {
+          setMessages(prev => [...prev, {
+            role: 'assistant',
+            content: res.data.content,
+            keyFindings: res.data.keyFindings || [],
+            evidence: res.data.evidence || [],
+            suggestedActions: res.data.suggestedActions || [],
+            timestamp: res.data.timestamp,
+          }]);
+
+          if (res.data.session_title) {
+            setSessions(prev =>
+              prev.map(s =>
+                s.session_id === sessionId
+                  ? { ...s, title: res.data.session_title, updated_at: new Date().toISOString(), message_count: (s.message_count || 0) + 2 }
+                  : s
+              )
+            );
+          }
+        }
+      } else {
+        // Fallback to direct assistant query
+        const res = await sendAssistantMessage(supplier.id, userMsg);
+        if (res.status === 'success') {
+          setMessages(prev => [...prev, res.data]);
+        }
       }
     } catch (error) {
       console.error("Chat failed:", error);
@@ -200,6 +406,8 @@ export default function AIAnalysis() {
             <p className="action-card-description">Chat with our AI assistant to get specific answers about this supplier.</p>
           </div>
         </div>
+      ) : activeAnalysis === 'pricing_analysis' ? (
+        <MarketPriceBenchmarking supplier={supplier} onBack={() => setActiveAnalysis(null)} />
       ) : activeAnalysis ? (
         <div className="card">
           <div className="card-header bg-gray-50 flex items-center justify-between">
@@ -335,95 +543,222 @@ export default function AIAnalysis() {
           </div>
         </div>
       ) : (
-        <div className="chat-container">
-          <div className="p-4 bg-gray-50 border-b border-gray-200 flex justify-between items-center">
-            <div className="flex items-center gap-2">
-              <Bot size={20} className="text-primary-600" />
-              <h2 className="font-semibold text-gray-800">Supplier Assistant</h2>
+        <div className="chat-container chat-container-with-sidebar">
+          {/* ChatGPT-style Chats History Sidebar */}
+          <div className="chat-history-sidebar">
+            <div className="chat-history-sidebar-header">
+              <button 
+                type="button" 
+                className="btn btn-primary btn-sm w-full flex items-center justify-center gap-1.5" 
+                onClick={handleNewChat}
+              >
+                <Plus size={14} />
+                <span>New Chat</span>
+              </button>
             </div>
-            <button className="btn btn-ghost btn-sm" onClick={() => setChatOpen(false)}>
-              Close
-            </button>
-          </div>
-          
-          <div className="chat-messages">
-            {messages.map((msg, idx) => (
-              <div key={idx} className={`chat-message ${msg.role}`}>
-                <div className="chat-message-avatar">
-                  {msg.role === 'assistant' ? <Bot size={16} /> : 'ME'}
+
+            {/* Search */}
+            <div className="chat-history-search">
+              <div className="input-with-icon">
+                <Search size={13} className="input-icon" />
+                <input
+                  type="text"
+                  className="input text-xs"
+                  placeholder="Search chats..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                />
+              </div>
+            </div>
+
+            {/* Session Folders List */}
+            <div className="chat-history-list">
+              {sessionsLoading ? (
+                <div className="p-4 text-center text-xs text-gray-400">Loading history...</div>
+              ) : (searchQuery ? sessions.filter(s => s.title.toLowerCase().includes(searchQuery.toLowerCase())) : sessions).length === 0 ? (
+                <div className="p-6 text-center text-xs text-gray-400 flex flex-col items-center gap-2">
+                  <FolderOpen size={24} className="text-gray-300" />
+                  <span>No previous chats</span>
+                  <span className="text-[10px] text-gray-400">Start asking questions to create your first session</span>
                 </div>
-                <div>
-                  <div className="chat-message-content" style={{ whiteSpace: 'pre-line' }}>
-                    {msg.content}
-                  </div>
-                  
-                  {msg.role === 'assistant' && (msg.keyFindings?.length > 0 || msg.evidence?.length > 0) && (
-                    <div className="chat-message-findings mt-3 bg-white p-4 rounded-lg border border-gray-100 shadow-sm">
-                      {msg.keyFindings?.length > 0 && (
-                        <div className="mb-3">
-                          <h4>Key Findings</h4>
-                          <ul>
-                            {msg.keyFindings.map((kf, i) => <li key={i}>{kf}</li>)}
-                          </ul>
-                        </div>
-                      )}
-                      
-                      {msg.suggestedActions?.length > 0 && (
-                        <div className="mb-3">
-                          <h4>Suggested Actions</h4>
-                          <div className="flex flex-wrap gap-2 mt-2">
-                            {msg.suggestedActions.map((action, i) => (
-                              <button key={i} className="btn btn-secondary btn-sm bg-gray-50">{action}</button>
-                            ))}
+              ) : (
+                groupSessionsByDate(
+                  searchQuery ? sessions.filter(s => s.title.toLowerCase().includes(searchQuery.toLowerCase())) : sessions
+                ).map(([groupLabel, groupSessions]) => (
+                  <div key={groupLabel} className="chat-sidebar-group">
+                    <div className="chat-sidebar-group-label">{groupLabel}</div>
+                    {groupSessions.map((s) => (
+                      <div
+                        key={s.session_id}
+                        className={`chat-sidebar-item ${activeSessionId === s.session_id ? 'active' : ''}`}
+                        onClick={() => handleSelectSession(s.session_id)}
+                      >
+                        {editingSessionId === s.session_id ? (
+                          <div className="chat-sidebar-item-edit" onClick={(e) => e.stopPropagation()}>
+                            <input
+                              type="text"
+                              className="input text-xs"
+                              value={editTitle}
+                              onChange={(e) => setEditTitle(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') handleSaveRename();
+                                if (e.key === 'Escape') setEditingSessionId(null);
+                              }}
+                              autoFocus
+                            />
+                            <button className="btn btn-ghost btn-sm p-1" onClick={handleSaveRename}><Check size={12} /></button>
+                            <button className="btn btn-ghost btn-sm p-1" onClick={() => setEditingSessionId(null)}><X size={12} /></button>
                           </div>
-                        </div>
-                      )}
+                        ) : (
+                          <>
+                            <MessageSquare size={13} className="chat-sidebar-item-icon" />
+                            <div className="chat-sidebar-item-content">
+                              <div className="chat-sidebar-item-title">{s.title}</div>
+                            </div>
+                            <div className="chat-sidebar-item-actions" onClick={(e) => e.stopPropagation()}>
+                              <button
+                                className="btn btn-ghost btn-sm p-1 text-gray-400 hover:text-gray-700"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setContextMenuSessionId(
+                                    contextMenuSessionId === s.session_id ? null : s.session_id
+                                  );
+                                }}
+                              >
+                                <MoreHorizontal size={13} />
+                              </button>
+                              {contextMenuSessionId === s.session_id && (
+                                <div className="chat-context-menu" onClick={(e) => e.stopPropagation()}>
+                                  <button onClick={() => handleStartRename(s)}>
+                                    <Edit3 size={11} /> Rename
+                                  </button>
+                                  <button className="danger" onClick={() => handleDeleteSession(s.session_id)}>
+                                    <Trash2 size={11} /> Delete
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+
+          {/* Main Chat Panel */}
+          <div className="chat-main-panel">
+            <div className="p-3 bg-gray-50 border-b border-gray-200 flex justify-between items-center">
+              <div className="flex items-center gap-2 min-w-0">
+                <Bot size={18} className="text-primary-600 shrink-0" />
+                <h2 className="font-semibold text-gray-800 text-sm truncate">
+                  {sessions.find(s => s.session_id === activeSessionId)?.title || `Supplier Assistant — ${supplier.name}`}
+                </h2>
+                <span className="badge badge-info text-[10px] shrink-0">{supplier.id}</span>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <Link
+                  to="/assistant"
+                  className="btn btn-ghost btn-sm text-xs flex items-center gap-1 text-gray-600 hover:text-primary-600"
+                  title="Open in dedicated full-page AI Assistant"
+                >
+                  <ExternalLink size={13} /> Fullscreen
+                </Link>
+                <button className="btn btn-ghost btn-sm text-xs" onClick={() => setChatOpen(false)}>
+                  Close
+                </button>
+              </div>
+            </div>
+            
+            <div className="chat-messages">
+              {messagesLoading ? (
+                <div className="loading-container py-12">
+                  <div className="loading-spinner"></div>
+                  <div className="loading-text">Loading conversation history...</div>
+                </div>
+              ) : (
+                messages.map((msg, idx) => (
+                  <div key={idx} className={`chat-message ${msg.role}`}>
+                    <div className="chat-message-avatar">
+                      {msg.role === 'assistant' ? <Bot size={16} /> : 'ME'}
+                    </div>
+                    <div>
+                      <div className="chat-message-content" style={{ whiteSpace: 'pre-line' }}>
+                        {msg.content}
+                      </div>
                       
-                      {msg.evidence?.length > 0 && (
-                        <div className="mt-3 pt-3 border-t border-gray-100">
-                          <button 
-                            className="evidence-trigger"
-                            onClick={() => openEvidence(msg.evidence, 'Supporting Evidence')}
-                          >
-                            View Evidence Sources
-                          </button>
+                      {msg.role === 'assistant' && (msg.keyFindings?.length > 0 || msg.evidence?.length > 0) && (
+                        <div className="chat-message-findings mt-3 bg-white p-4 rounded-lg border border-gray-100 shadow-sm">
+                          {msg.keyFindings?.length > 0 && (
+                            <div className="mb-3">
+                              <h4>Key Findings</h4>
+                              <ul>
+                                {msg.keyFindings.map((kf, i) => <li key={i}>{kf}</li>)}
+                              </ul>
+                            </div>
+                          )}
+                          
+                          {msg.suggestedActions?.length > 0 && (
+                            <div className="mb-3">
+                              <h4>Suggested Actions</h4>
+                              <div className="flex flex-wrap gap-2 mt-2">
+                                {msg.suggestedActions.map((action, i) => (
+                                  <button key={i} className="btn btn-secondary btn-sm bg-gray-50">{action}</button>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                          
+                          {msg.evidence?.length > 0 && (
+                            <div className="mt-3 pt-3 border-t border-gray-100">
+                              <button 
+                                className="evidence-trigger"
+                                onClick={() => openEvidence(msg.evidence, 'Supporting Evidence')}
+                              >
+                                View Evidence Sources
+                              </button>
+                            </div>
+                          )}
                         </div>
                       )}
                     </div>
-                  )}
+                  </div>
+                ))
+              )}
+              {isTyping && (
+                <div className="chat-message assistant">
+                  <div className="chat-message-avatar"><Bot size={16} /></div>
+                  <div className="chat-message-content bg-gray-100 flex items-center gap-1 h-10">
+                    <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce"></span>
+                    <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }}></span>
+                    <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0.4s' }}></span>
+                  </div>
                 </div>
-              </div>
-            ))}
-            {isTyping && (
-              <div className="chat-message assistant">
-                <div className="chat-message-avatar"><Bot size={16} /></div>
-                <div className="chat-message-content bg-gray-100 flex items-center gap-1 h-10">
-                  <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce"></span>
-                  <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }}></span>
-                  <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0.4s' }}></span>
-                </div>
-              </div>
-            )}
-            <div ref={messagesEndRef} />
+              )}
+              <div ref={messagesEndRef} />
+            </div>
+            
+            <form className="chat-input-area" onSubmit={handleSendMessage}>
+              <input 
+                ref={inputRef}
+                type="text" 
+                className="input" 
+                placeholder={`Ask about ${supplier.name}'s contracts, penalties, SLAs, pricing...`} 
+                value={inputMessage}
+                onChange={(e) => setInputMessage(e.target.value)}
+                disabled={isTyping}
+              />
+              <button 
+                type="submit" 
+                className="btn btn-primary"
+                disabled={isTyping || !inputMessage.trim()}
+              >
+                <Send size={18} />
+              </button>
+            </form>
           </div>
-          
-          <form className="chat-input-area" onSubmit={handleSendMessage}>
-            <input 
-              type="text" 
-              className="input" 
-              placeholder="Ask a question about this supplier..." 
-              value={inputMessage}
-              onChange={(e) => setInputMessage(e.target.value)}
-              disabled={isTyping}
-            />
-            <button 
-              type="submit" 
-              className="btn btn-primary"
-              disabled={isTyping || !inputMessage.trim()}
-            >
-              <Send size={18} />
-            </button>
-          </form>
         </div>
       )}
     </div>

@@ -3,36 +3,14 @@
 // Connected to FastAPI: GET /api/suppliers, GET /api/suppliers/{id}, POST /api/suppliers
 // ============================================================
 
-import { apiGet, apiPost, simulateDelay } from './client';
-import { mockSuppliers } from '../../data/mockData';
+import { apiGet, apiPost, apiDelete, apiUpload } from './client';
 
 export async function getSuppliers(filters = {}) {
   const res = await apiGet('/suppliers', filters);
-  if (res && res.status === 'success' && Array.isArray(res.data) && res.data.length > 0) {
+  if (res && res.status === 'success' && Array.isArray(res.data)) {
     return res;
   }
-
-  // Fallback to local mock data
-  await simulateDelay(200);
-  let suppliers = [...mockSuppliers];
-
-  if (filters.status) {
-    suppliers = suppliers.filter((s) => s.status === filters.status);
-  }
-  if (filters.category) {
-    suppliers = suppliers.filter((s) => s.category === filters.category);
-  }
-  if (filters.search) {
-    const query = filters.search.toLowerCase();
-    suppliers = suppliers.filter(
-      (s) =>
-        s.name.toLowerCase().includes(query) ||
-        s.category.toLowerCase().includes(query) ||
-        s.location.toLowerCase().includes(query)
-    );
-  }
-
-  return { status: 'success', data: suppliers };
+  return res || { status: 'error', data: [], message: 'Unable to load suppliers' };
 }
 
 export async function createSupplier(supplierData) {
@@ -41,24 +19,35 @@ export async function createSupplier(supplierData) {
     return res;
   }
 
-  await simulateDelay(200);
-  const newId = `SUP-${String(mockSuppliers.length + 1).padStart(3, '0')}`;
-  const newSupplier = {
-    id: newId,
-    name: supplierData.name,
-    category: supplierData.category || 'General Supplies',
-    location: supplierData.location || 'India',
-    status: supplierData.status || 'active',
-    relationshipYears: supplierData.relationshipYears || 1,
-    lastOrderDate: new Date().toISOString().split('T')[0],
-    renewalDate: new Date(Date.now() + 365 * 86400000).toISOString().split('T')[0],
-    contactPerson: supplierData.contactPerson || '',
-    contactEmail: supplierData.contactEmail || '',
-    contactPhone: supplierData.contactPhone || '',
-    riskScore: supplierData.riskScore || 25,
-  };
-  mockSuppliers.unshift(newSupplier);
-  return { status: 'success', data: newSupplier, message: 'Supplier created successfully' };
+  return res || { status: 'error', message: res?.message || 'Unable to create supplier' };
+}
+
+export async function extractSupplierFromContract(file) {
+  const formData = new FormData();
+  formData.append('file', file);
+
+  const res = await apiUpload('/suppliers/extract-from-contract', formData);
+  if (res && res.status === 'success' && res.data) {
+    return res;
+  }
+
+  return res || { status: 'error', message: res?.message || 'Contract extraction failed' };
+}
+
+export async function getAvailableDocuments() {
+  const res = await apiGet('/suppliers/available-documents');
+  if (res && res.status === 'success' && Array.isArray(res.data)) {
+    return res;
+  }
+  return res || { status: 'error', data: [], message: 'Unable to load available documents' };
+}
+
+export async function extractSupplierFromExisting(params = {}) {
+  const res = await apiPost('/suppliers/extract-from-existing', params);
+  if (res && res.status === 'success' && res.data) {
+    return res;
+  }
+  return res || { status: 'error', message: res?.message || 'Extraction from existing document failed' };
 }
 
 export async function getSupplierById(supplierId) {
@@ -67,12 +56,7 @@ export async function getSupplierById(supplierId) {
     return res;
   }
 
-  await simulateDelay(150);
-  const supplier = mockSuppliers.find((s) => s.id === supplierId);
-  if (!supplier) {
-    return { status: 'error', data: null, message: 'Supplier not found' };
-  }
-  return { status: 'success', data: supplier };
+  return res || { status: 'error', data: null, message: 'Supplier not found' };
 }
 
 export async function getSupplierCategories() {
@@ -81,7 +65,7 @@ export async function getSupplierCategories() {
     return res;
   }
 
-  await simulateDelay(100);
-  const categories = [...new Set(mockSuppliers.map((s) => s.category))];
-  return { status: 'success', data: categories };
+  return res || { status: 'error', data: [], message: 'Unable to load categories' };
 }
+
+export async function deleteSupplier(supplierId) { return apiDelete(`/suppliers/${supplierId}`); }

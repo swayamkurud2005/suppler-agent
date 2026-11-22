@@ -13,7 +13,7 @@ from decimal import Decimal
 from sqlalchemy import (
     String, Text, Integer, Numeric, Boolean, Date, DateTime,
     ForeignKey, Index, CheckConstraint, UniqueConstraint,
-    func, JSON,
+    func, JSON, LargeBinary,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -88,6 +88,8 @@ class Contract(Base):
         String(50), nullable=False, default="active"
     )
     document_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    document_data: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    document_filename: Mapped[str | None] = mapped_column(String(500), nullable=True)
     document_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     document_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     extraction_status: Mapped[str] = mapped_column(
@@ -391,4 +393,178 @@ class DocumentIngestionLog(Base):
     __table_args__ = (
         Index("ix_dil_contract", "contract_id"),
         Index("ix_dil_status", "status"),
+    )
+
+
+# ──────────────────────────────────────────────────────────────
+# L. chat_sessions — persistent conversation history
+# ──────────────────────────────────────────────────────────────
+class ChatSession(Base):
+    __tablename__ = "chat_sessions"
+
+    session_id: Mapped[str] = mapped_column(
+        String(64), primary_key=True, default=_uuid_str
+    )
+    supplier_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    supplier_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    title: Mapped[str] = mapped_column(String(500), nullable=False, default="New Chat")
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    message_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    messages: Mapped[list["ChatMessage"]] = relationship(
+        back_populates="session", lazy="selectin", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        Index("ix_chat_sessions_supplier", "supplier_id"),
+        Index("ix_chat_sessions_updated", "updated_at"),
+    )
+
+
+# ──────────────────────────────────────────────────────────────
+# M. chat_messages — individual messages within a session
+# ──────────────────────────────────────────────────────────────
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+
+    message_id: Mapped[str] = mapped_column(
+        String(64), primary_key=True, default=_uuid_str
+    )
+    session_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("chat_sessions.session_id"), nullable=False
+    )
+    role: Mapped[str] = mapped_column(
+        String(20), nullable=False
+    )  # user | assistant
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    key_findings: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    evidence: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    suggested_actions: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    session: Mapped["ChatSession"] = relationship(back_populates="messages")
+
+    __table_args__ = (
+        Index("ix_chat_messages_session", "session_id"),
+    )
+
+
+# ──────────────────────────────────────────────────────────────
+# N. price_research_runs — Market price benchmarking research runs
+# ──────────────────────────────────────────────────────────────
+class PriceResearchRun(Base):
+    __tablename__ = "price_research_runs"
+
+    id: Mapped[str] = mapped_column(
+        String(64), primary_key=True, default=_uuid_str
+    )
+    supplier_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("suppliers.supplier_id"), nullable=False
+    )
+    contract_id: Mapped[str | None] = mapped_column(
+        String(64), ForeignKey("contracts.contract_id"), nullable=True
+    )
+    material_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    grade: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    product_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    technical_characteristics: Mapped[str | None] = mapped_column(Text, nullable=True)
+    contract_price: Mapped[Decimal] = mapped_column(Numeric(14, 4), nullable=False)
+    contract_currency: Mapped[str] = mapped_column(String(10), nullable=False, default="INR")
+    contract_unit: Mapped[str] = mapped_column(String(50), nullable=False, default="kg")
+    contract_quantity: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    annual_quantity: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    delivery_terms: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    delivery_location: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    tax_terms: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    packaging_details: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    region: Mapped[str | None] = mapped_column(String(100), nullable=True, default="India")
+    comparison_period: Mapped[str | None] = mapped_column(String(50), nullable=True, default="Current Quarter")
+
+    # Benchmarks
+    market_benchmark_median: Mapped[Decimal | None] = mapped_column(Numeric(14, 4), nullable=True)
+    market_min_price: Mapped[Decimal | None] = mapped_column(Numeric(14, 4), nullable=True)
+    market_max_price: Mapped[Decimal | None] = mapped_column(Numeric(14, 4), nullable=True)
+    market_avg_price: Mapped[Decimal | None] = mapped_column(Numeric(14, 4), nullable=True)
+    variance_pct: Mapped[Decimal | None] = mapped_column(Numeric(8, 2), nullable=True)
+    potential_annual_difference: Mapped[Decimal | None] = mapped_column(Numeric(16, 2), nullable=True)
+    confidence_score: Mapped[Decimal | None] = mapped_column(Numeric(5, 2), nullable=True)
+    confidence_level: Mapped[str | None] = mapped_column(String(50), nullable=True)
+
+    # AI Insight
+    ai_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ai_insight: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(String(50), nullable=False, default="completed")
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    observations: Mapped[list["MarketPriceObservation"]] = relationship(
+        back_populates="research_run", lazy="selectin", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        Index("ix_prr_supplier", "supplier_id"),
+        Index("ix_prr_contract", "contract_id"),
+        Index("ix_prr_created", "created_at"),
+    )
+
+
+# ──────────────────────────────────────────────────────────────
+# O. market_price_observations — Individual market observations
+# ──────────────────────────────────────────────────────────────
+class MarketPriceObservation(Base):
+    __tablename__ = "market_price_observations"
+
+    id: Mapped[str] = mapped_column(
+        String(64), primary_key=True, default=_uuid_str
+    )
+    research_run_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("price_research_runs.id"), nullable=False
+    )
+    source_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_url: Mapped[str] = mapped_column(Text, nullable=False)
+    material_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    grade: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    specification: Mapped[str | None] = mapped_column(Text, nullable=True)
+    raw_price: Mapped[Decimal | None] = mapped_column(Numeric(14, 4), nullable=True)
+    raw_currency: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    raw_unit: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    normalized_price: Mapped[Decimal] = mapped_column(Numeric(14, 4), nullable=False)
+    normalized_currency: Mapped[str] = mapped_column(String(10), nullable=False)
+    normalized_unit: Mapped[str] = mapped_column(String(50), nullable=False)
+    exchange_rate_applied: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    unit_conversion_ratio: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    location: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    observation_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    price_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    delivery_conditions: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    tax_inclusion: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    match_classification: Mapped[str] = mapped_column(String(50), nullable=False, default="high")
+    match_rationale: Mapped[str | None] = mapped_column(Text, nullable=True)
+    snippet: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_included_in_benchmark: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    retrieved_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    research_run: Mapped["PriceResearchRun"] = relationship(back_populates="observations")
+
+    __table_args__ = (
+        Index("ix_mpo_run", "research_run_id"),
+        Index("ix_mpo_match", "match_classification"),
     )

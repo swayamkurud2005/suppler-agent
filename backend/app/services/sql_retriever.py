@@ -138,7 +138,7 @@ class SQLRetriever:
                 else:
                     delays_days.append(delay)
 
-        otd_rate = round((on_time_deliveries / total_deliveries * 100), 1) if total_deliveries > 0 else 92.0
+        otd_rate = round((on_time_deliveries / total_deliveries * 100), 1) if total_deliveries > 0 else 0.0
         avg_delay = round(sum(delays_days) / len(delays_days), 1) if delays_days else 0.0
 
         # 3. Quality defects
@@ -152,7 +152,7 @@ class SQLRetriever:
         qr_res = (await db.execute(qr_stmt)).first()
         inspected = qr_res.inspected if qr_res else 0
         defective = qr_res.defective if qr_res else 0
-        defect_rate = round((defective / inspected * 100), 2) if inspected > 0 else 0.8
+        defect_rate = round((defective / inspected * 100), 2) if inspected > 0 else 0.0
 
         return {
             "total_orders": total_orders,
@@ -206,7 +206,9 @@ class SQLRetriever:
                 qr_by_month[m_key]["inspected"] += (qr.quantity_inspected or 0)
                 qr_by_month[m_key]["defective"] += (qr.quantity_defective or 0)
 
-        all_months = ["May", "Jun", "Jul", "Aug", "Sep", "Oct"]
+        # Only return periods represented by persisted records.  Inventing empty
+        # months makes charts look populated for suppliers with no history.
+        all_months = list(dict.fromkeys([po.order_date.strftime("%b") for po, _ in rows if po.order_date] + list(qr_by_month.keys())))
         trends = []
         for m in all_months:
             data = monthly_data.get(m)
@@ -215,16 +217,16 @@ class SQLRetriever:
             if data and data["total_deliv"] > 0:
                 otd = round((data["on_time"] / data["total_deliv"]) * 100, 1)
             else:
-                otd = 94.0 if m in ["May", "Jun"] else 92.0
+                otd = 0.0
 
             if qr_data and qr_data["inspected"] > 0:
                 d_rate = round((qr_data["defective"] / qr_data["inspected"]) * 100, 2)
             else:
-                d_rate = 0.8 if m in ["May", "Jun"] else 1.0
+                d_rate = 0.0
 
-            orders_count = data["orders"] if data else (1 if m in ["May", "Jun"] else 0)
-            avg_lead = round(sum(data["delays"]) / len(data["delays"]) + 14, 1) if (data and data["delays"]) else 14.0
-            spend_amt = round(data["spend"], 2) if data and data["spend"] > 0 else (45000.0 if m in ["May", "Jun"] else 0.0)
+            orders_count = data["orders"] if data else 0
+            avg_lead = round(sum(data["delays"]) / len(data["delays"]), 1) if (data and data["delays"]) else 0.0
+            spend_amt = round(data["spend"], 2) if data and data["spend"] > 0 else 0.0
 
             trends.append({
                 "month": m,
@@ -260,8 +262,9 @@ class SQLRetriever:
             bench = (await db.execute(bench_stmt)).scalars().first()
 
             contracted = float(cp.contracted_unit_price) if cp.contracted_unit_price else 0.0
-            market = float(bench.benchmark_price) if bench else contracted * 0.95
-            diff_pct = round(((contracted - market) / market * 100), 2) if market > 0 else 0.0
+            # A missing benchmark is unavailable data, never a synthetic price.
+            market = float(bench.benchmark_price) if bench else None
+            diff_pct = round(((contracted - market) / market * 100), 2) if market and market > 0 else None
 
             comparisons.append({
                 "product_id": prod.product_id,
@@ -272,9 +275,12 @@ class SQLRetriever:
                 "price_variance_pct": diff_pct,
                 "currency": cp.currency or "USD",
                 "benchmark_source": bench.source_name if bench else "Market Average",
+                "benchmark_date": bench.benchmark_date.isoformat() if bench and bench.benchmark_date else None,
+                "available": bench is not None,
                 "recommendation": (
                     f"Contracted price is {abs(diff_pct)}% above benchmark. Negotiate downward."
-                    if diff_pct > 3.0
+                    if diff_pct is not None and diff_pct > 3.0
+                    else "No market benchmark is configured for this product." if bench is None
                     else "Contracted price is competitive with current market rates."
                 ),
             })
