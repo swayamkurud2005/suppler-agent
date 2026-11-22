@@ -1,0 +1,6 @@
+# Optional RAGAS evaluation dependencies; keep the application requirements separate.
+-r requirements.txt
+
+# Compatible with the project's LangChain 0.3.x pins.
+ragas==0.3.9
+langchain-openai==0.3.14

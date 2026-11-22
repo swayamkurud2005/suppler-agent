@@ -1,0 +1,349 @@
+"""
+Structured SQL retriever service.
+Extracts metrics, contract metadata, PO histories, delivery KPIs,
+defect rates, and price benchmarks directly from relational tables.
+"""
+
+from datetime import date
+from typing import Dict, Any, Optional, List
+from decimal import Decimal
+from collections import defaultdict
+
+from sqlalchemy import select, func, and_
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+from app.models.models import (
+    Supplier, Contract, ContractTerms, Product, ContractProduct,
+    PurchaseOrder, PurchaseOrderItem, Delivery, QualityRecord,
+    MarketPriceBenchmark
+)
+
+
+class SQLRetriever:
+    """Fetches normalized procurement records and aggregates from PostgreSQL."""
+
+    async def get_supplier_summary(self, db: AsyncSession, supplier_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch primary supplier profile."""
+        stmt = select(Supplier).where(Supplier.supplier_id == supplier_id)
+        result = await db.execute(stmt)
+        supplier = result.scalars().first()
+        if not supplier:
+            return None
+
+        return {
+            "supplier_id": supplier.supplier_id,
+            "supplier_name": supplier.supplier_name,
+            "category": supplier.category,
+            "location": supplier.location,
+            "country": supplier.country,
+            "status": supplier.status,
+            "risk_score": supplier.risk_score,
+            "relationship_years": supplier.relationship_years,
+            "contact_person": supplier.contact_person,
+            "contact_email": supplier.contact_email,
+            "contact_phone": supplier.contact_phone,
+        }
+
+    async def get_contract_details(self, db: AsyncSession, supplier_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch active contract, obligations, SLA, and terms."""
+        stmt = (
+            select(Contract)
+            .options(
+                selectinload(Contract.terms),
+                selectinload(Contract.contract_products).selectinload(ContractProduct.product),
+            )
+            .where(Contract.supplier_id == supplier_id)
+            .order_by(Contract.created_at.desc())
+        )
+        result = await db.execute(stmt)
+        contract = result.scalars().first()
+        if not contract:
+            return None
+
+        terms_dict = {}
+        if contract.terms:
+            t = contract.terms
+            terms_dict = {
+                "payment_on_order_pct": float(t.payment_on_order_pct) if t.payment_on_order_pct is not None else None,
+                "payment_before_shipment_pct": float(t.payment_before_shipment_pct) if t.payment_before_shipment_pct is not None else None,
+                "payment_terms_desc": t.payment_terms_desc,
+                "lead_time_days": t.lead_time_days,
+                "minimum_order_quantity": t.minimum_order_quantity,
+                "warranty_months": t.warranty_months,
+                "penalty_for_delay": t.penalty_for_delay,
+                "defect_notification_days": t.defect_notification_days,
+                "shipping_term": t.shipping_term,
+                "arbitration": f"{t.arbitration_organization}, {t.arbitration_location}" if t.arbitration_organization else None,
+            }
+
+        products_list = []
+        for cp in contract.contract_products:
+            products_list.append({
+                "product_id": cp.product_id,
+                "product_name": cp.product.product_name if cp.product else "Item",
+                "contracted_unit_price": float(cp.contracted_unit_price) if cp.contracted_unit_price else None,
+                "currency": cp.currency or "USD",
+                "min_annual_quantity": cp.minimum_annual_quantity,
+            })
+
+        return {
+            "contract_id": contract.contract_id,
+            "contract_title": contract.contract_title,
+            "contract_type": contract.contract_type,
+            "agreement_date": contract.agreement_date.isoformat() if contract.agreement_date else None,
+            "effective_date": contract.effective_date.isoformat() if contract.effective_date else None,
+            "expiry_date": contract.expiry_date.isoformat() if contract.expiry_date else None,
+            "term_years": contract.term_years,
+            "renewal_type": contract.renewal_type,
+            "termination_notice_months": contract.termination_notice_months,
+            "governing_law": contract.governing_law,
+            "status": contract.contract_status,
+            "document_path": contract.document_path,
+            "terms": terms_dict,
+            "products": products_list,
+        }
+
+    async def get_performance_kpis(self, db: AsyncSession, supplier_id: str) -> Dict[str, Any]:
+        """Compute on-time delivery rate, quality defect rate, and spend."""
+        # 1. Total POs and spend
+        po_stmt = (
+            select(
+                func.count(PurchaseOrder.order_id).label("total_orders"),
+                func.coalesce(func.sum(PurchaseOrder.total_amount), 0).label("total_spend"),
+            )
+            .where(PurchaseOrder.supplier_id == supplier_id)
+        )
+        po_res = (await db.execute(po_stmt)).first()
+        total_orders = po_res.total_orders if po_res else 0
+        total_spend = float(po_res.total_spend) if po_res else 0.0
+
+        # 2. Deliveries and On-Time Delivery (OTD)
+        deliv_stmt = (
+            select(Delivery)
+            .join(PurchaseOrder, Delivery.order_id == PurchaseOrder.order_id)
+            .where(PurchaseOrder.supplier_id == supplier_id)
+        )
+        deliv_res = (await db.execute(deliv_stmt)).scalars().all()
+
+        total_deliveries = len(deliv_res)
+        observed_deliveries = 0
+        on_time_deliveries = 0
+        delays_days = []
+
+        for d in deliv_res:
+            if d.delivery_status == "delivered" and d.actual_delivery_date and d.expected_delivery_date:
+                observed_deliveries += 1
+                delay = (d.actual_delivery_date - d.expected_delivery_date).days
+                if delay <= 0:
+                    on_time_deliveries += 1
+                else:
+                    delays_days.append(delay)
+
+        otd_rate = round((on_time_deliveries / observed_deliveries * 100), 1) if observed_deliveries else None
+        avg_delay = round(sum(delays_days) / len(delays_days), 1) if delays_days else (0.0 if observed_deliveries else None)
+
+        # 3. Quality defects
+        qr_stmt = (
+            select(
+                func.coalesce(func.sum(QualityRecord.quantity_inspected), 0).label("inspected"),
+                func.coalesce(func.sum(QualityRecord.quantity_defective), 0).label("defective"),
+            )
+            .where(QualityRecord.supplier_id == supplier_id)
+        )
+        qr_res = (await db.execute(qr_stmt)).first()
+        inspected = qr_res.inspected if qr_res else 0
+        defective = qr_res.defective if qr_res else 0
+        defect_rate = round((defective / inspected * 100), 2) if inspected > 0 else None
+
+        return {
+            "total_orders": total_orders,
+            "total_spend": total_spend,
+            "total_deliveries": total_deliveries,
+            "observed_deliveries": observed_deliveries,
+            "on_time_delivery_rate_pct": otd_rate,
+            "avg_delay_days": avg_delay,
+            "total_inspected": inspected,
+            "total_defective": defective,
+            "defect_rate_pct": defect_rate,
+            "quality_rating_pct": round(100.0 - defect_rate, 1) if defect_rate is not None else None,
+        }
+
+    async def get_monthly_performance_trends(self, db: AsyncSession, supplier_id: str) -> List[Dict[str, Any]]:
+        """Compute monthly performance trends from purchase orders, deliveries, and quality records in PostgreSQL."""
+        stmt = (
+            select(PurchaseOrder, Delivery)
+            .outerjoin(Delivery, PurchaseOrder.order_id == Delivery.order_id)
+            .where(PurchaseOrder.supplier_id == supplier_id)
+            .order_by(PurchaseOrder.order_date.asc())
+        )
+        res = await db.execute(stmt)
+        rows = res.all()
+
+        monthly_data = defaultdict(lambda: {"orders": 0, "spend": 0.0, "on_time": 0, "total_deliv": 0, "delays": []})
+
+        for po, deliv in rows:
+            if not po.order_date:
+                continue
+            m_key = po.order_date.strftime("%b")
+            monthly_data[m_key]["orders"] += 1
+            monthly_data[m_key]["spend"] += float(po.total_amount)
+            if deliv and deliv.actual_delivery_date and deliv.expected_delivery_date:
+                monthly_data[m_key]["total_deliv"] += 1
+                diff = (deliv.actual_delivery_date - deliv.expected_delivery_date).days
+                if diff <= 0:
+                    monthly_data[m_key]["on_time"] += 1
+                else:
+                    monthly_data[m_key]["delays"].append(diff)
+
+        qr_stmt = (
+            select(QualityRecord)
+            .where(QualityRecord.supplier_id == supplier_id)
+            .order_by(QualityRecord.inspection_date.asc())
+        )
+        qr_res = (await db.execute(qr_stmt)).scalars().all()
+        qr_by_month = defaultdict(lambda: {"inspected": 0, "defective": 0})
+        for qr in qr_res:
+            if qr.inspection_date:
+                m_key = qr.inspection_date.strftime("%b")
+                qr_by_month[m_key]["inspected"] += (qr.quantity_inspected or 0)
+                qr_by_month[m_key]["defective"] += (qr.quantity_defective or 0)
+
+        all_months = list(dict.fromkeys([*monthly_data.keys(), *qr_by_month.keys()]))
+        trends = []
+        for m in all_months:
+            data = monthly_data.get(m)
+            qr_data = qr_by_month.get(m)
+
+            if data and data["total_deliv"] > 0:
+                otd = round((data["on_time"] / data["total_deliv"]) * 100, 1)
+            else:
+                otd = None
+
+            if qr_data and qr_data["inspected"] > 0:
+                d_rate = round((qr_data["defective"] / qr_data["inspected"]) * 100, 2)
+            else:
+                d_rate = None
+
+            orders_count = data["orders"] if data else 0
+            avg_lead = None
+            spend_amt = round(data["spend"], 2) if data else 0.0
+
+            trends.append({
+                "month": m,
+                "onTimeRate": otd,
+                "onTimeDelivery": otd,
+                "defectRate": d_rate,
+                "qualityScore": round(100.0 - d_rate, 1) if d_rate is not None else None,
+                "ordersPlaced": orders_count,
+                "avgLeadTime": avg_lead,
+                "spend": spend_amt,
+            })
+
+        return trends
+
+    async def get_price_comparison(self, db: AsyncSession, supplier_id: str) -> List[Dict[str, Any]]:
+        """Compare supplier's contracted unit prices against regional market benchmarks."""
+        stmt = (
+            select(ContractProduct, Product)
+            .join(Product, ContractProduct.product_id == Product.product_id)
+            .join(Contract, ContractProduct.contract_id == Contract.contract_id)
+            .where(Contract.supplier_id == supplier_id)
+        )
+        res = await db.execute(stmt)
+        rows = res.all()
+
+        comparisons = []
+        for cp, prod in rows:
+            bench_stmt = (
+                select(MarketPriceBenchmark)
+                .where(
+                    MarketPriceBenchmark.product_id == prod.product_id,
+                    MarketPriceBenchmark.is_demo.is_(False),
+                )
+                .order_by(MarketPriceBenchmark.benchmark_date.desc(), MarketPriceBenchmark.retrieved_at.desc())
+            )
+            bench = (await db.execute(bench_stmt)).scalars().first()
+            historical = None
+            if bench is None:
+                history_stmt = (
+                    select(PurchaseOrderItem, PurchaseOrder)
+                    .join(PurchaseOrder, PurchaseOrderItem.order_id == PurchaseOrder.order_id)
+                    .where(
+                        PurchaseOrderItem.product_id == prod.product_id,
+                        PurchaseOrder.is_demo.is_(False),
+                    )
+                    .order_by(PurchaseOrder.order_date.desc())
+                    .limit(1)
+                )
+                historical = (await db.execute(history_stmt)).first()
+
+            contracted_decimal = Decimal(str(cp.contracted_unit_price or 0))
+            contracted = float(contracted_decimal)
+            historical_item, historical_order = historical if historical else (None, None)
+            historical_compatible = bool(
+                historical_item and prod.package_unit
+                and (cp.currency or prod.currency or "USD").upper() == (historical_order.currency or "USD").upper()
+            )
+            commodity_matches = bool(
+                bench and bench.benchmark_type == "commodity_reference"
+                and bench.metal_symbol and bench.metal_symbol.casefold() in prod.product_name.casefold()
+            )
+            compatible = bool(
+                bench
+                and bench.verification_status == "verified"
+                and (cp.currency or prod.currency or "USD").upper() == bench.currency.upper()
+                and bench.unit and prod.package_unit and bench.unit.lower() == prod.package_unit.lower()
+                and (commodity_matches or (
+                    bench.product_specification and prod.description
+                    and bench.product_specification.strip().casefold() == prod.description.strip().casefold()
+                ))
+            )
+            if not bench and historical_compatible:
+                market_decimal = Decimal(str(historical_item.unit_price))
+            else:
+                market_decimal = Decimal(str(bench.benchmark_price)) if compatible else None
+            diff_pct = (
+                float(((contracted_decimal - market_decimal) / market_decimal * Decimal("100")).quantize(Decimal("0.01")))
+                if market_decimal and market_decimal > 0 and contracted_decimal > 0 else None
+            )
+            benchmark_date = bench.benchmark_date if bench else historical_order.order_date if historical_compatible else None
+            stale_after_days = 7 if bench else 90
+            stale = bool(benchmark_date and (date.today() - benchmark_date).days > stale_after_days)
+            if not bench:
+                status = ("benchmark_stale" if stale else "comparison_available") if historical_compatible else "benchmark_unavailable"
+            elif bench.verification_status != "verified":
+                status = "benchmark_unavailable"
+            elif not compatible:
+                status = "specification_mismatch"
+            else:
+                status = "benchmark_stale" if stale else "comparison_available"
+
+            comparisons.append({
+                "product_id": prod.product_id,
+                "product_name": prod.product_name,
+                "category": prod.category,
+                "contracted_price": contracted,
+                "market_benchmark_price": float(market_decimal) if market_decimal is not None else None,
+                "price_variance_pct": diff_pct,
+                "currency": cp.currency or prod.currency or (bench.currency if bench else None),
+                "benchmark_source": bench.source_name if bench else "Historical purchase order" if historical_compatible else None,
+                "benchmark_type": bench.benchmark_type if bench else "historical_purchase" if historical_compatible else None,
+                "benchmark_currency": bench.currency if bench else historical_order.currency if historical_compatible else None,
+                "benchmark_unit": bench.unit if bench else prod.package_unit if historical_compatible else None,
+                "benchmark_date": benchmark_date.isoformat() if benchmark_date else None,
+                "benchmark_retrieved_at": bench.retrieved_at.isoformat() if bench and bench.retrieved_at else None,
+                "benchmark_status": status,
+                "recommendation": (
+                    f"Contracted price is {abs(diff_pct)}% above benchmark. Negotiate downward."
+                    if diff_pct is not None and diff_pct > 3.0 else
+                    "Contracted price is competitive with current market rates."
+                    if status == "comparison_available" and diff_pct is not None else
+                    f"Price comparison unavailable: {status.replace('_', ' ')}."
+                ),
+            })
+
+        return comparisons
+
+
+sql_retriever = SQLRetriever()
